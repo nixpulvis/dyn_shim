@@ -1,8 +1,11 @@
 // Several methods declare lifetimes that could be elided; they are explicit on
 // purpose, to exercise lifetime forwarding.
 #![allow(clippy::needless_lifetimes)]
+// `fn by_self(self: Self)` is written with the explicit arbitrary-self spelling
+// on purpose, to exercise that the macro rewrites it like by-value `self`.
+#![allow(clippy::needless_arbitrary_self_type)]
 
-use dyn_shim::{dyn_shim, dyn_shim_foreign, dyn_shim_recognized, dyn_shim_bind};
+use dyn_shim::{dyn_shim, dyn_shim_bind, dyn_shim_foreign, dyn_shim_recognized};
 use std::fmt::Display;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -932,11 +935,11 @@ mod dyn_shim_bind_hash {
         let by_ref: &dyn Tagged = &Label(5);
         // The trait's own methods still work; the attribute only adds the impl.
         assert_eq!(boxed.tag(), 5);
-        assert_eq!(bh.hash_one(&*boxed), bh.hash_one(&Label(5)));
-        assert_eq!(bh.hash_one(by_ref), bh.hash_one(&Label(5)));
+        assert_eq!(bh.hash_one(&*boxed), bh.hash_one(Label(5)));
+        assert_eq!(bh.hash_one(by_ref), bh.hash_one(Label(5)));
         // Box<dyn Tagged> hashes via std's forwarding impl for Box<T: Hash>.
-        assert_eq!(bh.hash_one(&boxed), bh.hash_one(&Label(5)));
-        assert_ne!(bh.hash_one(by_ref), bh.hash_one(&Label(6)));
+        assert_eq!(bh.hash_one(&boxed), bh.hash_one(Label(5)));
+        assert_ne!(bh.hash_one(by_ref), bh.hash_one(Label(6)));
     }
 }
 
@@ -1073,7 +1076,7 @@ mod dyn_shim_bind_combined {
         let bh = BuildHasherDefault::<DefaultHasher>::default();
         let boxed: Box<dyn Node> = Box::new(Leaf(3));
         assert_eq!(boxed.clone().id(), 3);
-        assert_eq!(bh.hash_one(&*boxed), bh.hash_one(&Leaf(3)));
+        assert_eq!(bh.hash_one(&*boxed), bh.hash_one(Leaf(3)));
     }
 
     #[test]
@@ -1087,7 +1090,7 @@ mod dyn_shim_bind_combined {
 
         // `+ Send + Sync`, in any order, hashes through its own impl.
         let both: &(dyn Node + Sync + Send) = &Leaf(4);
-        assert_eq!(bh.hash_one(both), bh.hash_one(&Leaf(4)));
+        assert_eq!(bh.hash_one(both), bh.hash_one(Leaf(4)));
 
         // `+ Sync` is cloneable too.
         let sync: Box<dyn Node + Sync> = Box::new(Leaf(4));

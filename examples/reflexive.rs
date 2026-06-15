@@ -121,7 +121,10 @@ fn main() {
         let why = String::from_utf8(why).unwrap();
 
         // bare: `&**rule` is a `&dyn DynRule`, accepted as a `&impl Rule`.
-        println!("{name}: {value} passes = {} ({why})", passes(&**rule, value));
+        println!(
+            "{name}: {value} passes = {} ({why})",
+            passes(&**rule, value)
+        );
 
         // `parsed` is generic, so it is not on the shim; on the erased value it
         // reaches the `None` stub rather than panicking.

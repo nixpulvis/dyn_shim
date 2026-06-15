@@ -60,6 +60,6 @@ fn main() {
     println!("container hash: {:016x}", bh.hash_one(&container));
     assert_eq!(
         bh.hash_one(&*container.trait_object),
-        bh.hash_one(&String::from(line))
+        bh.hash_one(String::from(line))
     );
 }

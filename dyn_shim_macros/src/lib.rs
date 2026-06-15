@@ -233,9 +233,11 @@ impl RecognizedBound {
         let principal = quote! { $principal };
         let markers = quote! { $($marker)* };
         match self {
-            RecognizedBound::Clone => {
-                clone_bridge(&principal, &markers, |recv| quote! { $crate::__clone_box(#recv) })
-            }
+            RecognizedBound::Clone => clone_bridge(
+                &principal,
+                &markers,
+                |recv| quote! { $crate::__clone_box(#recv) },
+            ),
             RecognizedBound::Hash => hash_bridge(&principal, &markers, &quote! { #carrier }),
         }
     }
@@ -2021,11 +2023,7 @@ fn erase_generic(sig: &Signature) -> syn::Result<ErasedFn> {
                 ));
             }
             GenericParam::Type(t) => {
-                let traits: Vec<&Path> = t
-                    .bounds
-                    .iter()
-                    .filter_map(plain_trait_bound)
-                    .collect();
+                let traits: Vec<&Path> = t.bounds.iter().filter_map(plain_trait_bound).collect();
                 let [path] = traits.as_slice() else {
                     return Err(syn::Error::new_spanned(
                         t,
@@ -2165,7 +2163,11 @@ fn erase_arg_ty(
             };
             uses[idx] += 1;
             let (_, path, maybe_sized) = &params[idx];
-            let kind = if *maybe_sized { Erased::Direct } else { reborrow };
+            let kind = if *maybe_sized {
+                Erased::Direct
+            } else {
+                reborrow
+            };
             (path.clone(), kind)
         }
         // `&[mut] impl Bound` (argument-position impl Trait), an anonymous
@@ -2315,7 +2317,10 @@ fn forward(
 ///
 /// Receiver handling matches [`forward`]: a by-value `self` becomes `self:
 /// Box<Self>`, forwarded by dereference.
-fn forward_erased(method: &TraitItemFn, src: &TokenStream2) -> syn::Result<(TokenStream2, TokenStream2)> {
+fn forward_erased(
+    method: &TraitItemFn,
+    src: &TokenStream2,
+) -> syn::Result<(TokenStream2, TokenStream2)> {
     let ErasedFn {
         mut sig,
         preamble,
