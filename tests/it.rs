@@ -1151,6 +1151,49 @@ mod erase_generic_arg {
     }
 }
 
+// When an erased parameter is declared `?Sized`, `#[dyn_shim(erase)]` forwards
+// the lowered trait object directly instead of reborrowing it. The source
+// method's parameter then infers to `dyn Sink` (allowed, since it is `?Sized`),
+// which an object-safe bound satisfies on its own. No `impl Sink for &mut dyn
+// Sink` is required, unlike the reborrowed `&mut impl Sink` case.
+mod erase_unsized_bound {
+    use dyn_shim::dyn_shim;
+
+    trait Sink {
+        fn put(&mut self, byte: u8);
+    }
+
+    struct Buf(Vec<u8>);
+    impl Sink for Buf {
+        fn put(&mut self, byte: u8) {
+            self.0.push(byte);
+        }
+    }
+
+    #[dyn_shim(DynWriter)]
+    trait Writer {
+        #[dyn_shim(erase)]
+        fn spill<S: Sink + ?Sized>(&self, out: &mut S);
+    }
+
+    struct Source;
+    impl Writer for Source {
+        fn spill<S: Sink + ?Sized>(&self, out: &mut S) {
+            out.put(1);
+            out.put(2);
+        }
+    }
+
+    #[test]
+    fn unsized_bound_forwards_object_directly() {
+        let w: Box<dyn DynWriter> = Box::new(Source);
+        let mut buf = Buf(Vec::new());
+        // `&mut buf` coerces to the shim's `&mut dyn Sink` argument.
+        w.spill(&mut buf);
+        assert_eq!(buf.0, vec![1, 2]);
+    }
+}
+
 // `#[dyn_shim(boxed)]` makes a `-> Self` builder dispatchable by boxing the
 // result into the shim object: the shim method returns `Box<dyn DynBuilder>`,
 // and the `reflexive = boxed` impl satisfies the source `-> Self` (where `Self`

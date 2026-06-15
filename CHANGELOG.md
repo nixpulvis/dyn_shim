@@ -25,7 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `#[dyn_shim(erase)]` keeps a method that is non-dyn-compatible only because of
   a generic type parameter or argument-position `impl Trait` (bounded by a
   single trait, used behind a reference) by lowering the parameter to a trait
-  object, e.g. `&mut impl Write` -> `&mut dyn Write`.
+  object, e.g. `&mut impl Write` -> `&mut dyn Write`. A `?Sized` parameter
+  (`<W: Write + ?Sized>`) forwards the lowered object directly, so any
+  object-safe bound works; a sized parameter reborrows, so its bound must
+  forward through references (as `Hasher`, `Write`, and `Read` do).
 - `#[dyn_shim(boxed)]` dispatches a `-> Self` builder by making the shim method
   return `Box<dyn Shim>`, so consuming and chaining builders keep working
   through an erased value.

@@ -1970,20 +1970,34 @@ enum Erased {
     /// `&mut P` was lowered to `&mut dyn Bound`; forward `&mut arg` (needs a
     /// `let mut` rebinding).
     Mut,
+    /// `&[mut] P` for a `?Sized` parameter `P` was lowered to `&[mut] dyn Bound`;
+    /// forward `arg` itself. Because `P: ?Sized`, the source method's parameter
+    /// can infer to the unsized `dyn Bound` directly, which an object-safe bound
+    /// satisfies on its own. No reborrow, so no `impl Bound for &[mut] dyn Bound`
+    /// is required (the reborrowing `Shared` / `Mut` paths do need one).
+    Direct,
 }
 
 /// Lower a method's generic parameters, each bounded by a single trait and used
 /// only behind a reference, to `&dyn Bound` / `&mut dyn Bound`. This is the
 /// transform behind `#[dyn_shim(erase)]`: a generic argument such as `w: &mut
 /// impl Write` (or a named `<W: Write>` used as `&mut W`) cannot enter a vtable,
-/// but `w: &mut dyn Write` can. Forwarding reborrows the argument (`&mut w`) so
-/// the source method's type parameter re-infers to the sized reference type,
-/// which is sound exactly when std (or the bound's author) provides `impl Bound
-/// for &mut (dyn Bound)` — true for `Hasher`, `Write`, `Read`, and friends.
+/// but `w: &mut dyn Write` can. How the argument forwards depends on whether the
+/// parameter is `Sized`:
 ///
-/// The recognized [`Hash`](RecognizedBound::Hash) carrier is the proof case: its
-/// hidden hashing method is this transform applied to `fn(&self, &mut impl
-/// Hasher)`.
+/// - A `Sized` parameter (a named `<W: Write>` or an `impl Write`) cannot be the
+///   unsized `dyn Write`, so forwarding reborrows the argument (`&mut w`) and the
+///   source's type parameter re-infers to the sized reference type `&mut dyn
+///   Write`. Sound exactly when std (or the bound's author) provides `impl Bound
+///   for &mut (dyn Bound)` — true for `Hasher`, `Write`, `Read`, and friends.
+/// - A `?Sized` parameter (a named `<W: Write + ?Sized>`) forwards the lowered
+///   object directly, so the source's type parameter infers to `dyn Write`
+///   itself. That needs no reference-forwarding impl, only that the bound be
+///   object-safe (so `dyn Write: Write` holds).
+///
+/// The recognized [`Hash`](RecognizedBound::Hash) carrier is the proof case for
+/// the reborrow path: its hidden hashing method is this transform applied to
+/// `fn(&self, &mut impl Hasher)`.
 ///
 /// Returns `Err` for a parameter that cannot be erased — a const generic, more
 /// than one trait bound, a use by value or in the return type, or a use in more
@@ -1992,11 +2006,11 @@ enum Erased {
 fn erase_generic(sig: &Signature) -> syn::Result<ErasedFn> {
     let mut sig = sig.clone();
 
-    // Each erasable type parameter and the single trait path it is bounded by,
-    // the only shape that lowers to one `dyn Bound`. A `?Sized` relaxation is
-    // ignored (the parameter is dropped anyway); lifetime bounds are kept out of
-    // the count.
-    let mut params: Vec<(Ident, Path)> = Vec::new();
+    // Each erasable type parameter, the single trait path it is bounded by (the
+    // only shape that lowers to one `dyn Bound`), and whether it relaxes `Sized`.
+    // A `?Sized` parameter forwards its lowered object directly rather than by
+    // reborrow; lifetime bounds are kept out of the count.
+    let mut params: Vec<(Ident, Path, bool)> = Vec::new();
     for param in &sig.generics.params {
         match param {
             GenericParam::Lifetime(_) => {}
@@ -2022,7 +2036,8 @@ fn erase_generic(sig: &Signature) -> syn::Result<ErasedFn> {
                         ),
                     ));
                 };
-                params.push((t.ident.clone(), (*path).clone()));
+                let maybe_sized = t.bounds.iter().any(is_maybe_sized);
+                params.push((t.ident.clone(), (*path).clone(), maybe_sized));
             }
         }
     }
@@ -2041,14 +2056,14 @@ fn erase_generic(sig: &Signature) -> syn::Result<ErasedFn> {
     // A parameter used outside a single reference argument — in the return type,
     // by value, or more than once — cannot be erased.
     if let ReturnType::Type(_, ty) = &sig.output
-        && let Some((ident, _)) = params.iter().find(|(id, _)| type_mentions_ident(ty, id))
+        && let Some((ident, _, _)) = params.iter().find(|(id, _, _)| type_mentions_ident(ty, id))
     {
         return Err(syn::Error::new_spanned(
             ty,
             format!("#[dyn_shim(erase)] cannot erase `{ident}`: it appears in the return type"),
         ));
     }
-    for ((ident, _), count) in params.iter().zip(&uses) {
+    for ((ident, _, _), count) in params.iter().zip(&uses) {
         if *count == 0 {
             return Err(syn::Error::new_spanned(
                 ident,
@@ -2071,7 +2086,7 @@ fn erase_generic(sig: &Signature) -> syn::Result<ErasedFn> {
 
     // Drop the erased parameters (now all type parameters) and any `where`
     // predicate bounding them, leaving only lifetimes.
-    let erased_idents: Vec<&Ident> = params.iter().map(|(id, _)| id).collect();
+    let erased_idents: Vec<&Ident> = params.iter().map(|(id, _, _)| id).collect();
     sig.generics.params = std::mem::take(&mut sig.generics.params)
         .into_iter()
         .filter(|p| !matches!(p, GenericParam::Type(t) if erased_idents.contains(&&t.ident)))
@@ -2106,7 +2121,9 @@ fn erase_generic(sig: &Signature) -> syn::Result<ErasedFn> {
                 args.push(quote! { &mut #name });
             }
             Some(Erased::Shared) => args.push(quote! { & #name }),
-            None => args.push(quote! { #name }),
+            // A `?Sized` parameter's object, and any non-erased argument, forward
+            // by name.
+            Some(Erased::Direct) | None => args.push(quote! { #name }),
         }
     }
 
@@ -2124,32 +2141,36 @@ fn erase_generic(sig: &Signature) -> syn::Result<ErasedFn> {
 /// caller's by-value / return-type checks to reject.
 fn erase_arg_ty(
     ty: &mut Type,
-    params: &[(Ident, Path)],
+    params: &[(Ident, Path, bool)],
     uses: &mut [usize],
 ) -> syn::Result<Option<Erased>> {
     let Type::Reference(reference) = ty else {
         return Ok(None);
     };
-    let kind = if reference.mutability.is_some() {
+    let reborrow = if reference.mutability.is_some() {
         Erased::Mut
     } else {
         Erased::Shared
     };
-    let bound: Path = match &*reference.elem {
-        // `&[mut] P` for a named parameter P.
+    let (bound, kind): (Path, Erased) = match &*reference.elem {
+        // `&[mut] P` for a named parameter P. A `?Sized` parameter forwards its
+        // object directly (`Erased::Direct`); a sized one reborrows.
         Type::Path(p) if p.qself.is_none() => {
             let Some(idx) = p
                 .path
                 .get_ident()
-                .and_then(|id| params.iter().position(|(pid, _)| pid == id))
+                .and_then(|id| params.iter().position(|(pid, _, _)| pid == id))
             else {
                 return Ok(None);
             };
             uses[idx] += 1;
-            params[idx].1.clone()
+            let (_, path, maybe_sized) = &params[idx];
+            let kind = if *maybe_sized { Erased::Direct } else { reborrow };
+            (path.clone(), kind)
         }
         // `&[mut] impl Bound` (argument-position impl Trait), an anonymous
-        // single-bounded parameter.
+        // single-bounded parameter. An `impl Trait` parameter is always `Sized`,
+        // so it always reborrows.
         Type::ImplTrait(it) => {
             let traits: Vec<&Path> = it.bounds.iter().filter_map(plain_trait_bound).collect();
             let [path] = traits.as_slice() else {
@@ -2159,12 +2180,22 @@ fn erase_arg_ty(
                      trait bound to lower it to a single `dyn Bound`",
                 ));
             };
-            (*path).clone()
+            ((*path).clone(), reborrow)
         }
         _ => return Ok(None),
     };
     *reference.elem = parse_quote! { dyn #bound };
     Ok(Some(kind))
+}
+
+/// True if a bound is a `?Sized` relaxation (`Sized` with the maybe modifier),
+/// which marks a type parameter that may be unsized.
+fn is_maybe_sized(bound: &syn::TypeParamBound) -> bool {
+    matches!(
+        bound,
+        syn::TypeParamBound::Trait(t)
+            if matches!(t.modifier, syn::TraitBoundModifier::Maybe(_)) && t.path.is_ident("Sized")
+    )
 }
 
 /// True if a type mentions the given identifier as a path segment.
