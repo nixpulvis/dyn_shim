@@ -2591,6 +2591,11 @@ fn reflexive_method(
     let names = rename_args(&mut sig);
     let cfg_attrs = cfg_gates(method);
 
+    // A stub body (`panic` / `stub = ...`) typically ignores the arguments, so
+    // silence the unused-variable warnings the restated signature would draw.
+    let stub_allow = stub_body
+        .is_some()
+        .then(|| quote! { #[allow(unused_variables)] });
     let body = match stub_body {
         Some(body) => body,
         None => {
@@ -2609,6 +2614,7 @@ fn reflexive_method(
 
     Ok(Some(quote! {
         #(#cfg_attrs)*
+        #stub_allow
         #[allow(deprecated)]
         #sig { #body }
     }))
