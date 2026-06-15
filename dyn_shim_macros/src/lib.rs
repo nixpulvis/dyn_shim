@@ -1540,6 +1540,17 @@ fn expand(
     // `Box<dyn Shim>`, so a reflexive impl on a `+ marker` object form cannot be
     // satisfied by it. Reject that combination up front rather than emit a type
     // error on generated code; the boxed builder is still usable without markers.
+    //
+    // TODO: lift this gate. `build_boxed_method` already emits per-combo
+    // `Box<dyn Shim + markers>` (that is how the `Clone` carrier supports
+    // markers), so the blocker is only the forwarding side: a builder's reflexive
+    // impl forwards through the shared, combo-independent `@mount` entries, which
+    // cannot pick a per-combo method. Lifting it means emitting suffixed shim
+    // methods (`add`, `add_send`, ...) like `Clone`'s `__dyn_shim_clone_box`, and
+    // teaching the mount layer to route each combo's impl to the matching suffix
+    // — which `macro_rules!` cannot do today (it cannot derive a suffix ident
+    // from the `$($marker)*` tokens). That is a change to the mount machinery, not
+    // more sharing; see `build_mount_macro`.
     if !reflexive.is_empty()
         && !autos.is_empty()
         && let Some(method) = items.iter().find_map(|item| match item {
