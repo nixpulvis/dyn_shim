@@ -1,5 +1,5 @@
-//! Mounting the `Clone` and `Hash` carriers onto the objects of an existing
-//! dyn-compatible trait with `#[trait_object]`.
+//! Binding the `Clone` and `Hash` carriers onto the objects of an existing
+//! dyn-compatible trait with `#[dyn_shim_bind]`.
 //!
 //! `Widget` below is already dyn-compatible: it has only `&self` methods, so
 //! `dyn Widget` works on its own. What it lacks is `Hash` and `Clone` on the
@@ -7,21 +7,21 @@
 //! shim, but here `dyn Widget` is the type used directly, so generating a second
 //! trait is not wanted.
 //!
-//! `#[trait_object(DynHash + DynClone)]` mounts those carriers in place instead.
+//! `#[dyn_shim_bind(DynHash + DynClone)]` binds those carriers in place instead.
 //! The trait inherits `DynHash` and `DynClone` as supertraits, and the attribute
-//! invokes their mount macros to make `dyn Widget` implement `Hash` and `Box<dyn
+//! invokes their bind macros to make `dyn Widget` implement `Hash` and `Box<dyn
 //! Widget>` implement `Clone`. Because the carriers are supertraits, every
 //! `Widget` implementor must be `Hash` and `Clone`.
 //!
-//! See `mount_trait.rs` for naming a `#[dyn_shim]` shim as the carrier, which
+//! See `bind_trait.rs` for naming a `#[dyn_shim]` shim as the carrier, which
 //! gives `dyn Widget` an arbitrary non-dyn-compatible trait the same way.
 //!
-//! Run with: `cargo run --example trait_object --features "dyn_hash dyn_clone"`
+//! Run with: `cargo run --example dyn_shim_bind --features "dyn_hash dyn_clone"`
 
-use dyn_shim::{DynClone, DynHash, trait_object};
+use dyn_shim::{DynClone, DynHash, dyn_shim_bind};
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 
-#[trait_object(DynHash + DynClone)]
+#[dyn_shim_bind(DynHash + DynClone)]
 trait Widget: DynHash + DynClone {
     fn render(&self) -> String;
 }

@@ -116,15 +116,15 @@ fn recognized_misuse_rejected() {
     t.compile_fail("tests/ui/recognized_has_items.rs");
 }
 
-// `trait_object` mounts a carrier onto a trait that already inherits it. It
+// `dyn_shim_bind` binds a carrier onto a trait that already inherits it. It
 // rejects a missing carrier supertrait, an argument list naming no carrier, and
 // the old spelling that named a capability (`Clone`/`Hash`) instead of a
 // carrier trait. All three errors come from the macro itself, so the snapshots
 // are stable across toolchains.
 #[test]
-fn trait_object_misuse_rejected() {
+fn dyn_shim_bind_misuse_rejected() {
     let t = trybuild::TestCases::new();
-    t.compile_fail("tests/ui/trait_object_missing_carrier.rs");
-    t.compile_fail("tests/ui/trait_object_no_recognized.rs");
-    t.compile_fail("tests/ui/trait_object_capability_name.rs");
+    t.compile_fail("tests/ui/dyn_shim_bind_missing_carrier.rs");
+    t.compile_fail("tests/ui/dyn_shim_bind_no_recognized.rs");
+    t.compile_fail("tests/ui/dyn_shim_bind_capability_name.rs");
 }

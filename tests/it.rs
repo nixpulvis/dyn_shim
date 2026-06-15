@@ -2,7 +2,7 @@
 // purpose, to exercise lifetime forwarding.
 #![allow(clippy::needless_lifetimes)]
 
-use dyn_shim::{dyn_shim, dyn_shim_foreign, dyn_shim_recognized, trait_object};
+use dyn_shim::{dyn_shim, dyn_shim_foreign, dyn_shim_recognized, dyn_shim_bind};
 use std::fmt::Display;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -902,17 +902,17 @@ fn hash_bound_shim_upcasts_to_dyn_hash() {
     assert_eq!(bh.hash_one(erased), bh.hash_one(&Red));
 }
 
-// `#[trait_object(DynHash)]` mounts the `DynHash` carrier onto a trait the user
+// `#[dyn_shim_bind(DynHash)]` binds the `DynHash` carrier onto a trait the user
 // owns that is already dyn-compatible, generating no shim. The trait inherits
 // `DynHash` as an explicit supertrait, and the attribute emits `impl Hash for dyn
 // Tagged`, which also covers `&dyn Tagged` and (through std's forwarding impl)
 // `Box<dyn Tagged>`.
 #[cfg(feature = "dyn_hash")]
-mod trait_object_hash {
-    use dyn_shim::{DynHash, trait_object};
+mod dyn_shim_bind_hash {
+    use dyn_shim::{DynHash, dyn_shim_bind};
     use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 
-    #[trait_object(DynHash)]
+    #[dyn_shim_bind(DynHash)]
     trait Tagged: DynHash {
         fn tag(&self) -> u32;
     }
@@ -940,14 +940,14 @@ mod trait_object_hash {
     }
 }
 
-// `#[trait_object(DynClone)]` makes `Box<dyn Drawing>` cloneable and `dyn
+// `#[dyn_shim_bind(DynClone)]` makes `Box<dyn Drawing>` cloneable and `dyn
 // Drawing` `ToOwned`, cloning the underlying concrete value into a fresh box. The
 // carrier is the `DynClone` supertrait.
 #[cfg(feature = "dyn_clone")]
-mod trait_object_clone {
-    use dyn_shim::{DynClone, trait_object};
+mod dyn_shim_bind_clone {
+    use dyn_shim::{DynClone, dyn_shim_bind};
 
-    #[trait_object(DynClone)]
+    #[dyn_shim_bind(DynClone)]
     trait Drawing: DynClone {
         fn area(&self) -> u32;
     }
@@ -988,11 +988,11 @@ mod trait_object_clone {
     }
 }
 
-// `#[trait_object(DynRecipe)]` mounts a `#[dyn_shim]` shim's source trait onto a
+// `#[dyn_shim_bind(DynRecipe)]` binds a `#[dyn_shim]` shim's source trait onto a
 // *different* dyn-compatible trait the user owns. `Recipe` is not dyn-compatible
 // (its `portion` method is generic), so it cannot be a supertrait of `Dish`.
 // Instead `Dish` inherits the generated `DynRecipe` shim, and the attribute
-// invokes the shim's mount macro to emit `impl Recipe for dyn Dish` and
+// invokes the shim's bind macro to emit `impl Recipe for dyn Dish` and
 // `impl Recipe for Box<dyn Dish>`, forwarding the dyn-compatible methods through
 // the shim. So a `&dyn Dish` and an owned `Box<dyn Dish>` each satisfy `Recipe`,
 // even though `dyn Dish` carries it through the `DynRecipe` carrier, not as a
@@ -1005,7 +1005,7 @@ trait Recipe {
     fn portion<U: From<u32>>(&self) -> U; // generic: not dyn-compatible
 }
 
-#[trait_object(DynRecipe)]
+#[dyn_shim_bind(DynRecipe)]
 trait Dish: DynRecipe {
     fn name(&self) -> &str;
 }
@@ -1036,26 +1036,26 @@ fn consume(r: impl Recipe) -> u32 {
 }
 
 #[test]
-fn trait_object_mounts_shim_source_onto_principal() {
+fn dyn_shim_bind_binds_shim_source_onto_principal() {
     let dish: Box<dyn Dish> = Box::new(Pasta);
     assert_eq!(dish.name(), "pasta"); // Dish's own method still works
-    // `&dyn Dish` satisfies `Recipe` by reference (the bare mount).
+    // `&dyn Dish` satisfies `Recipe` by reference (the bare bind).
     assert_eq!(total(&*dish), 400);
     // The generic `portion` lives only on the concrete type (it is a panicking
-    // stub on the erased mount); call it before erasing.
+    // stub on the erased bind); call it before erasing.
     assert_eq!(Recipe::portion::<u32>(&Pasta), 400);
-    // `Box<dyn Dish>` satisfies `Recipe` by value (the boxed mount).
+    // `Box<dyn Dish>` satisfies `Recipe` by value (the boxed bind).
     assert_eq!(consume(dish), 800);
 }
 
 // Hash and Clone combine in one attribute, and listed auto traits select the
 // covered `dyn` marker variants, exactly as for a recognized bound.
 #[cfg(all(feature = "dyn_clone", feature = "dyn_hash"))]
-mod trait_object_combined {
-    use dyn_shim::{DynClone, DynHash, trait_object};
+mod dyn_shim_bind_combined {
+    use dyn_shim::{DynClone, DynHash, dyn_shim_bind};
     use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 
-    #[trait_object(DynHash + DynClone + Send + Sync)]
+    #[dyn_shim_bind(DynHash + DynClone + Send + Sync)]
     trait Node: DynHash + DynClone {
         fn id(&self) -> u32;
     }

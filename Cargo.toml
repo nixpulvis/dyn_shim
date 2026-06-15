@@ -22,7 +22,7 @@ dyn_clone = ["dyn_shim_macros/dyn_clone"]
 # recognized `Hash` bound add `DynHash` as a supertrait of the shim.
 dyn_hash = ["dyn_shim_macros/dyn_hash"]
 
-# Feature-gated items (`DynClone`, `DynHash`, `trait_object`) should appear in
+# Feature-gated items (`DynClone`, `DynHash`, `dyn_shim_bind`) should appear in
 # the published docs, so build them with every feature on.
 [package.metadata.docs.rs]
 all-features = true
@@ -33,10 +33,10 @@ dyn_shim_macros = { version = "0.2.0", path = "dyn_shim_macros" }
 [dev-dependencies]
 trybuild = "1.0"
 
-# `#[trait_object]` rides on the `DynHash`/`DynClone` carriers, so these examples
+# `#[dyn_shim_bind]` rides on the `DynHash`/`DynClone` carriers, so these examples
 # need the matching feature.
 [[example]]
-name = "trait_object"
+name = "dyn_shim_bind"
 required-features = ["dyn_hash", "dyn_clone"]
 
 [[example]]

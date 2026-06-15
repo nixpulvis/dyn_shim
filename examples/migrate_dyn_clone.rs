@@ -1,4 +1,4 @@
-//! Migrating the `dyn-clone` README example to `#[trait_object]`.
+//! Migrating the `dyn-clone` README example to `#[dyn_shim_bind]`.
 //!
 //! `dyn-clone` makes a `Box<dyn MyTrait>` cloneable in two pieces: a `DynClone`
 //! supertrait that carries the erased clone, and either the `clone_box` free
@@ -28,7 +28,7 @@
 //!
 //! The `dyn_shim` version keeps the trait, its `DynClone` supertrait, and the
 //! `dyn MyTrait` type unchanged. Two things move: the import points at
-//! `dyn_shim`, and `#[trait_object(DynClone)]` on the trait stands in for the
+//! `dyn_shim`, and `#[dyn_shim_bind(DynClone)]` on the trait stands in for the
 //! `clone_trait_object!` call. The attribute makes `Box<dyn MyTrait>` implement
 //! `Clone`, so `dyn_clone::clone_box(&*x)` becomes `x.clone()`; it also gives
 //! `dyn MyTrait` a `ToOwned` impl, so `(&*x).to_owned()` is the direct
@@ -36,9 +36,9 @@
 //!
 //! Run with: `cargo run --example migrate_dyn_clone --features dyn_clone`
 
-use dyn_shim::{DynClone, trait_object};
+use dyn_shim::{DynClone, dyn_shim_bind};
 
-#[trait_object(DynClone)]
+#[dyn_shim_bind(DynClone)]
 trait MyTrait: DynClone {
     fn recite(&self);
 }
@@ -55,7 +55,7 @@ fn main() {
     let x: Box<dyn MyTrait> = Box::new(String::from(line));
     x.recite();
 
-    // Using #[trait_object(DynClone)] let's us call .clone here directly.
+    // Using #[dyn_shim_bind(DynClone)] let's us call .clone here directly.
     let x2 = x.clone();
     x2.recite();
 }

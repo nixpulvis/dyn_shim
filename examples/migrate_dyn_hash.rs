@@ -1,4 +1,4 @@
-//! Migrating the `dyn-hash` README example to `#[trait_object]`.
+//! Migrating the `dyn-hash` README example to `#[dyn_shim_bind]`.
 //!
 //! `dyn-hash` makes a `Box<dyn MyTrait>` hashable in two pieces: a `DynHash`
 //! supertrait that carries the erased hashing, and a `hash_trait_object!` macro
@@ -24,16 +24,16 @@
 //! The `dyn_shim` version keeps the trait, its `DynHash` supertrait, and the
 //! `dyn MyTrait` type unchanged. Two things move: the import points at
 //! `dyn_shim`, and the separate `hash_trait_object!(MyTrait)` call becomes a
-//! `#[trait_object(DynHash)]` attribute on the trait. `dyn MyTrait` then implements
+//! `#[dyn_shim_bind(DynHash)]` attribute on the trait. `dyn MyTrait` then implements
 //! `Hash`, covering `Box<dyn MyTrait>` through the standard library's forwarding
 //! impl, so the `Container` derive works as before.
 //!
 //! Run with: `cargo run --example migrate_dyn_hash --features dyn_hash`
 
-use dyn_shim::{DynHash, trait_object};
+use dyn_shim::{DynHash, dyn_shim_bind};
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 
-#[trait_object(DynHash)]
+#[dyn_shim_bind(DynHash)]
 trait MyTrait: DynHash {
     fn recite(&self);
 }

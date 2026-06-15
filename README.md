@@ -41,20 +41,24 @@ let total: usize = parsers.iter().map(|p| p.parse("a b c")).sum();
 assert_eq!(total, 3 + 5);
 ```
 
-## `dyn-hash` support
+## As a `dyn-clone` / `dyn-hash` Replacement
 
-With the `dyn_hash` feature, `DynHash` is a drop-in for the
-[`dyn-hash`](https://crates.io/crates/dyn-hash) crate:
+With the `dyn_clone` / `dyn_hash` feature, `DynClone` and `DynHash` are near
+drop-in replacements for the [`dyn-clone`](https://crates.io/crates/dyn-clone)
+and [`dyn-hash`](https://crates.io/crates/dyn-hash) crates. You keep the
+`DynClone` / `DynHash` supertrait and the `clone_trait_object!(MyTrait)` or
+`hash_trait_object!(MyTrait)` macro calls become a `#[dyn_shim_bind(DynClone)]` or
+`#[dyn_shim_bind(DynHash)]` attribute on the trait.
 
 ```toml
-dyn_shim = { version = "0.2", features = ["dyn_hash"] }
+dyn_shim = { version = "0.2", features = ["dyn_clone", "dyn_hash"] }
 ```
 
 ```rust
-use dyn_shim::DynHash;
+use dyn_shim::{dyn_shim_bind, DynClone, DynHash};
 
-// `dyn DynHash` (and so `Box<dyn DynHash>`) implements `Hash`.
-let boxed: Box<dyn DynHash> = Box::new(42u32);
+#[dyn_shim_bind(DynClone + DynHash)]
+trait MyTrait: DynClone + DynHash { /* ... */ }
 ```
 
 See the [API documentation](https://docs.rs/dyn_shim) for the rest.

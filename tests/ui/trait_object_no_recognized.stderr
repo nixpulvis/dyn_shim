@@ -1,5 +1,0 @@
-error: trait_object expects at least one carrier trait to mount (`DynClone`, `DynHash`, or a `#[dyn_shim]` shim), optionally followed by auto-trait markers
- --> tests/ui/trait_object_no_recognized.rs:5:16
-  |
-5 | #[trait_object(Send)]
-  |                ^^^^

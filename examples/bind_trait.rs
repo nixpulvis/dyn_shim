@@ -1,5 +1,5 @@
-//! Mounting a non-dyn-compatible trait onto a trait object you own, using a
-//! `#[dyn_shim]` shim as the carrier for `#[trait_object]`.
+//! Binding a non-dyn-compatible trait onto a trait object you own, using a
+//! `#[dyn_shim]` shim as the carrier for `#[dyn_shim_bind]`.
 //!
 //! `Priced` is not dyn-compatible: `quote` is generic over its return type, so
 //! it cannot enter a vtable, and therefore `Priced` cannot be a supertrait of a
@@ -11,34 +11,34 @@
 //! - `#[dyn_shim(DynPriced)]` builds a dyn-compatible shim of `Priced`'s
 //!   dispatchable methods. `Product` inherits `DynPriced`, so `dyn Product`
 //!   carries them.
-//! - `#[trait_object(DynPriced)]` mounts `Priced` back onto `dyn Product` and
+//! - `#[dyn_shim_bind(DynPriced)]` binds `Priced` back onto `dyn Product` and
 //!   `Box<dyn Product>`, forwarding through the shim. `quote` is generic, so it
 //!   gets a panicking stub there (`#[dyn_shim(panic)]`); call it on a concrete
 //!   product, before erasing.
 //!
-//! This is the same mounting operation `reflexive` performs, aimed at a trait
-//! object other than the shim's own. The shim's mount macro is what carries
-//! `Priced`'s method shapes to the `#[trait_object]` site, so it works even when
+//! This is the same binding operation `reflexive` performs, aimed at a trait
+//! object other than the shim's own. The shim's bind macro is what carries
+//! `Priced`'s method shapes to the `#[dyn_shim_bind]` site, so it works even when
 //! `Product` lives in a different module or crate from `Priced`.
 //!
-//! Run with: `cargo run --example mount_trait`
+//! Run with: `cargo run --example bind_trait`
 
-use dyn_shim::{dyn_shim, trait_object};
+use dyn_shim::{dyn_shim, dyn_shim_bind};
 
 #[dyn_shim(DynPriced)]
 trait Priced {
     fn price(&self) -> u32;
     fn discounted(&self, percent: u32) -> u32;
     // Generic over the return type, so not dyn-compatible: it cannot forward
-    // through the shim, so the mounted impl gives it a panicking stub.
+    // through the shim, so the generated impl gives it a panicking stub.
     #[dyn_shim(panic)]
     fn quote<T: From<u32>>(&self) -> T;
 }
 
 // `Product` is dyn-compatible and is the type held behind `dyn`. It inherits the
-// `DynPriced` carrier, and `#[trait_object(DynPriced)]` mounts `Priced` onto its
+// `DynPriced` carrier, and `#[dyn_shim_bind(DynPriced)]` binds `Priced` onto its
 // objects.
-#[trait_object(DynPriced)]
+#[dyn_shim_bind(DynPriced)]
 trait Product: DynPriced {
     fn sku(&self) -> &str;
 }
@@ -64,13 +64,13 @@ impl Product for Book {
 }
 
 // Generic over `Priced` by reference: a `&dyn Product` satisfies it through the
-// mounted bare impl, no allocation.
+// bare impl, no allocation.
 fn shelf_price(p: &(impl Priced + ?Sized)) -> u32 {
     p.price()
 }
 
 // Generic over `Priced` by value: a `Box<dyn Product>` satisfies it through the
-// mounted boxed impl.
+// boxed impl.
 fn checkout(p: impl Priced) -> u32 {
     p.discounted(10)
 }
@@ -81,7 +81,7 @@ fn main() {
     // `dyn Product`'s own method.
     println!("sku:       {}", product.sku());
 
-    // `&dyn Product` is accepted as a `&impl Priced` (bare mount).
+    // `&dyn Product` is accepted as a `&impl Priced` (bare bind).
     println!("price:     {}", shelf_price(&*product));
 
     // `quote` is generic, so it lives only on the concrete type; on the erased
@@ -89,6 +89,6 @@ fn main() {
     let q: u64 = Book { cents: 1200 }.quote();
     println!("quote u64: {q}");
 
-    // `Box<dyn Product>` is consumed as an owned `impl Priced` (boxed mount).
+    // `Box<dyn Product>` is consumed as an owned `impl Priced` (boxed bind).
     println!("checkout:  {}", checkout(product));
 }

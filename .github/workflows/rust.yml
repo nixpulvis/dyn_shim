@@ -16,7 +16,7 @@ jobs:
 
     strategy:
       matrix:
-        # `DynClone`, `DynHash`, and `trait_object` are feature-gated, so cover
+        # `DynClone`, `DynHash`, and `dyn_shim_bind` are feature-gated, so cover
         # no features, each on its own, and both together.
         features:
           - ""

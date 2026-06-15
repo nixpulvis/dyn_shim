@@ -128,7 +128,7 @@ impl Parse for ForeignArgs {
 
 /// A bare `+`-joined bound list, the whole attribute argument for both
 /// [`macro@dyn_shim_recognized`] (a recognized trait to expose as a shim, plus
-/// auto-trait markers) and [`macro@trait_object`] (recognized traits to
+/// auto-trait markers) and [`macro@dyn_shim_bind`] (recognized traits to
 /// implement for a trait's `dyn` objects, plus markers). Each validates the
 /// contents itself; this only parses the syntax (`Clone + Send`).
 struct BoundList {
@@ -212,9 +212,9 @@ impl RecognizedBound {
         }
     }
 
-    /// The body of the `@mount` arm of this carrier's mount macro: the bridge
+    /// The body of the `@bind` arm of this carrier's bind macro: the bridge
     /// impls that put the capability on `dyn $principal $($marker)*`, forwarding
-    /// through the carrier the way `#[trait_object]` does. `$principal` and
+    /// through the carrier the way `#[dyn_shim_bind]` does. `$principal` and
     /// `$marker` are emitted as literal metavariables for the surrounding
     /// `macro_rules!` to bind; `carrier` is the carrier trait whose inherited
     /// method does the erased work (the shim this macro is generated for).
@@ -223,7 +223,7 @@ impl RecognizedBound {
     /// the fat-pointer splice in `__clone_box` (there is no blanket impl to clone
     /// through here, unlike a recognized bound). `Hash` forwards through the
     /// carrier's `__dyn_shim_hash`, which erases the generic hasher.
-    fn mount_arm(self, carrier: &Ident) -> TokenStream2 {
+    fn bind_arm(self, carrier: &Ident) -> TokenStream2 {
         match self {
             RecognizedBound::Clone => quote! {
                 impl ::std::clone::Clone for ::std::boxed::Box<dyn $principal $($marker)*> {
@@ -403,7 +403,7 @@ impl MarkerCombo {
 /// value into a fresh `Box<dyn principal markers>`. `call` builds the cloning
 /// expression from the receiver it is handed (`&**self` for `Clone`, `self` for
 /// `ToOwned`). The two paths that emit these differ only in `call`: a recognized
-/// bound forwards through a generated carrier method, while `trait_object` calls
+/// bound forwards through a generated carrier method, while `dyn_shim_bind` calls
 /// `__clone_box`.
 fn clone_bridge(
     principal: &Ident,
@@ -435,7 +435,7 @@ fn clone_bridge(
 /// `impl<T: ?Sized + Hash> Hash for Box<T>`, `Box<dyn principal>`. `carrier`
 /// names the trait whose `__dyn_shim_hash` does the erased hashing: the shim
 /// itself for a recognized bound (where that method is generated), or `DynHash`
-/// for `trait_object` (inherited as a supertrait). It is named in a qualified
+/// for `dyn_shim_bind` (inherited as a supertrait). It is named in a qualified
 /// call so it stays unambiguous when the principal also inherits a same-named
 /// method.
 fn hash_bridge(principal: &Ident, markers: &TokenStream2, carrier: &TokenStream2) -> TokenStream2 {
@@ -1260,7 +1260,7 @@ pub fn dyn_shim_recognized(attr: TokenStream, item: TokenStream) -> TokenStream 
     expand_recognized(&input, bounds)
 }
 
-/// Mount a *carrier* onto the trait objects of a dyn-compatible trait you
+/// Bind a *carrier* onto the trait objects of a dyn-compatible trait you
 /// already own, so `dyn YourTrait` satisfies a trait it cannot carry as a
 /// supertrait — without generating a shim.
 ///
@@ -1269,32 +1269,32 @@ pub fn dyn_shim_recognized(attr: TokenStream, item: TokenStream) -> TokenStream 
 /// the trait is already dyn-compatible, and you want its `dyn` objects to also
 /// satisfy some target trait. It generates no trait and no blanket impl — it
 /// re-emits the annotated trait untouched and invokes each listed carrier's
-/// mount macro, which stamps the `impl Target for dyn YourTrait` blocks.
+/// bind macro, which stamps the `impl Target for dyn YourTrait` blocks.
 ///
-/// A **carrier** is a trait the annotated trait inherits whose mount macro knows
+/// A **carrier** is a trait the annotated trait inherits whose bind macro knows
 /// how to implement a target on a `dyn` type. Two kinds exist, reached the same
 /// way:
 ///
 /// - The shipped [`DynClone`] / [`DynHash`] (behind the `dyn_clone` / `dyn_hash`
 ///   features). Their target is `Clone` / `Hash`, which cannot be a supertrait
-///   of a dyn-compatible trait. `#[trait_object(DynClone)]` makes `Box<dyn
-///   YourTrait>` cloneable (and `dyn YourTrait` `ToOwned`); `#[trait_object(
+///   of a dyn-compatible trait. `#[dyn_shim_bind(DynClone)]` makes `Box<dyn
+///   YourTrait>` cloneable (and `dyn YourTrait` `ToOwned`); `#[dyn_shim_bind(
 ///   DynHash)]` makes `dyn YourTrait` (and so `&dyn` and `Box<dyn>`) hashable.
 /// - Any [`macro@dyn_shim`] shim `DynFoo`. Its target is the source trait `Foo`,
-///   which is not dyn-compatible. `#[trait_object(DynFoo)]` makes `dyn YourTrait`
+///   which is not dyn-compatible. `#[dyn_shim_bind(DynFoo)]` makes `dyn YourTrait`
 ///   and `Box<dyn YourTrait>` satisfy `Foo`, forwarding the dyn-compatible
 ///   methods through the shim. This is how a non-dyn-compatible `Foo` reaches a
 ///   trait object that could never list it as a supertrait: inherit `DynFoo`
-///   instead, then mount `Foo` back on.
+///   instead, then bind `Foo` back on.
 ///
 /// The carrier is written as an explicit supertrait, so a reader sees that every
 /// implementor must satisfy it:
 ///
 /// ```
-/// use dyn_shim::{DynHash, trait_object};
+/// use dyn_shim::{DynHash, dyn_shim_bind};
 /// use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 ///
-/// #[trait_object(DynHash)]
+/// #[dyn_shim_bind(DynHash)]
 /// trait Event: DynHash {
 ///     fn name(&self) -> &str;
 /// }
@@ -1311,17 +1311,17 @@ pub fn dyn_shim_recognized(attr: TokenStream, item: TokenStream) -> TokenStream 
 /// assert_eq!(bh.hash_one(&*boxed), bh.hash_one(&Tick(7)));
 /// ```
 ///
-/// Several carriers may be combined (`#[trait_object(DynHash + DynClone)]`,
-/// `#[trait_object(DynFoo + DynClone)]`), and auto-trait markers select the
+/// Several carriers may be combined (`#[dyn_shim_bind(DynHash + DynClone)]`,
+/// `#[dyn_shim_bind(DynFoo + DynClone)]`), and auto-trait markers select the
 /// covered `dyn` variants exactly as for a [recognized
-/// bound](macro@dyn_shim#recognized-bounds): `#[trait_object(DynClone + Send)]`
+/// bound](macro@dyn_shim#recognized-bounds): `#[dyn_shim_bind(DynClone + Send)]`
 /// makes both `Box<dyn YourTrait>` and `Box<dyn YourTrait + Send>` cloneable.
 ///
 /// # The carrier is a supertrait, so the contract is strict
 ///
 /// `#[dyn_shim(DynFoo: Hash)]` generates a separate `DynFoo` shim and bounds its
 /// blanket impl by `Hash`, so a non-`Hash` implementor of `Foo` simply never
-/// becomes a `DynFoo`. `#[trait_object(...)]` adds no shim and instead requires
+/// becomes a `DynFoo`. `#[dyn_shim_bind(...)]` adds no shim and instead requires
 /// the carrier as a supertrait of the annotated trait itself, so the contract is
 /// stricter: *every* implementor must satisfy the carrier. Reach for this
 /// attribute when the annotated trait is the `dyn` type you use directly; reach
@@ -1329,10 +1329,10 @@ pub fn dyn_shim_recognized(attr: TokenStream, item: TokenStream) -> TokenStream 
 ///
 /// # Relation to [`reflexive`](macro@dyn_shim#reflexive-impl)
 ///
-/// Mounting a shim carrier (`#[trait_object(DynFoo)]`) and a `reflexive` impl are
+/// Binding a shim carrier (`#[dyn_shim_bind(DynFoo)]`) and a `reflexive` impl are
 /// the same operation through the same generated macro: both stamp `impl Foo for
-/// <object>`. `reflexive` mounts onto the shim's *own* objects (`dyn DynFoo`,
-/// `Box<dyn DynFoo>`) at the shim's definition; `#[trait_object(DynFoo)]` mounts
+/// <object>`. `reflexive` binds onto the shim's *own* objects (`dyn DynFoo`,
+/// `Box<dyn DynFoo>`) at the shim's definition; `#[dyn_shim_bind(DynFoo)]` binds
 /// onto a *different* principal that inherits the shim, anywhere `DynFoo` is in
 /// scope (including another crate).
 ///
@@ -1340,12 +1340,12 @@ pub fn dyn_shim_recognized(attr: TokenStream, item: TokenStream) -> TokenStream 
 /// `DynHash`, `DynFoo`), the same token-match convention as the rest of the
 /// crate: a missing carrier supertrait is reported at the attribute. The carrier
 /// must be in scope as a macro at the use site, which its own import provides
-/// (`use krate::DynFoo` brings the trait and its mount macro together).
+/// (`use krate::DynFoo` brings the trait and its bind macro together).
 #[proc_macro_attribute]
-pub fn trait_object(attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn dyn_shim_bind(attr: TokenStream, item: TokenStream) -> TokenStream {
     let BoundList { bounds } = parse_macro_input!(attr as BoundList);
     let input = parse_macro_input!(item as ItemTrait);
-    expand_trait_object(&input, bounds)
+    expand_dyn_shim_bind(&input, bounds)
 }
 
 /// If the annotated trait has any generic parameters, return the compile error
@@ -1366,7 +1366,7 @@ fn reject_generics(input: &ItemTrait, message: &str) -> Option<TokenStream> {
 /// order. `supertraits` is the auto-trait and pass-through bounds in listing
 /// order, ready to re-emit as a shim's supertraits. `passthrough` is just the
 /// plain pass-through bounds, kept for their spans: `dyn_shim` keeps them as
-/// supertraits, while `trait_object` and `dyn_shim_recognized` reject the first
+/// supertraits, while `dyn_shim_bind` and `dyn_shim_recognized` reject the first
 /// one. `rejected` pairs each known-impossible bound (`Copy`, `Ord`, ...) with
 /// its targeted message, in listing order. Duplicates are dropped silently,
 /// matching the language's own tolerance of `trait Foo: A + A`.
@@ -1415,24 +1415,24 @@ impl ClassifiedBounds {
     }
 }
 
-/// Expansion for [`macro@trait_object`]: re-emit the annotated trait unchanged
-/// and mount each listed carrier onto its `dyn` objects by invoking that
-/// carrier's generated mount macro. A carrier is any trait the annotated trait
-/// inherits whose mount macro stamps `impl Target for dyn Trait` — the shipped
+/// Expansion for [`macro@dyn_shim_bind`]: re-emit the annotated trait unchanged
+/// and bind each listed carrier onto its `dyn` objects by invoking that
+/// carrier's generated bind macro. A carrier is any trait the annotated trait
+/// inherits whose bind macro stamps `impl Target for dyn Trait` — the shipped
 /// `DynClone`/`DynHash`, or a `#[dyn_shim]` shim. Auto traits in the list are
 /// markers selecting the covered `dyn` variants, exactly as for a recognized
 /// bound. This emits no impls itself; the linking lives entirely in the
 /// carriers' macros, shared with the `reflexive` option.
-fn expand_trait_object(
+fn expand_dyn_shim_bind(
     input: &ItemTrait,
     bounds: Punctuated<TypeParamBound, Token![+]>,
 ) -> TokenStream {
-    if let Some(err) = reject_generics(input, "trait_object does not support generic traits") {
+    if let Some(err) = reject_generics(input, "dyn_shim_bind does not support generic traits") {
         return err;
     }
 
     // Split the list: auto traits are markers, every other bound is a carrier to
-    // mount (named by its mount macro). A bare `Clone`/`Hash` names a capability
+    // bind (named by its bind macro). A bare `Clone`/`Hash` names a capability
     // rather than a carrier trait, so it is rejected toward the carrier to name.
     let mut carriers: Vec<Path> = Vec::new();
     let mut autos: Vec<AutoTrait> = Vec::new();
@@ -1468,7 +1468,7 @@ fn expand_trait_object(
     if carriers.is_empty() {
         return syn::Error::new_spanned(
             &bounds,
-            "trait_object expects at least one carrier trait to mount (`DynClone`, `DynHash`, \
+            "dyn_shim_bind expects at least one carrier trait to bind (`DynClone`, `DynHash`, \
              or a `#[dyn_shim]` shim), optionally followed by auto-trait markers",
         )
         .to_compile_error()
@@ -1476,7 +1476,7 @@ fn expand_trait_object(
     }
 
     // Each carrier must be inherited as a supertrait, so `dyn Trait: Carrier`
-    // holds and the mounted impl's forwarding body type-checks. Report a missing
+    // holds and the generated impl's forwarding body type-checks. Report a missing
     // one here, at the attribute, rather than as a macro-not-found or
     // trait-bound error on generated code.
     for carrier in &carriers {
@@ -1487,18 +1487,18 @@ fn expand_trait_object(
 
     let trait_ident = &input.ident;
     let combos = MarkerCombo::all(&autos);
-    let mut mounts = TokenStream2::new();
+    let mut binds = TokenStream2::new();
     for carrier in &carriers {
         for MarkerCombo { markers, .. } in &combos {
-            mounts.extend(quote! {
-                #carrier! { @mount (#trait_ident) ( #markers ) }
+            binds.extend(quote! {
+                #carrier! { @bind (#trait_ident) ( #markers ) }
             });
         }
     }
 
     quote! {
         #input
-        #mounts
+        #binds
     }
     .into()
 }
@@ -1506,7 +1506,7 @@ fn expand_trait_object(
 /// Check that the annotated trait inherits `carrier` as a supertrait, matched by
 /// the carrier path's last segment (a bare-name token match, like
 /// [`Classified::of`]). Without it, `dyn Trait: Carrier` would not hold and the
-/// mounted impl's forwarding call would fail to compile on generated code.
+/// generated impl's forwarding call would fail to compile on generated code.
 fn require_carrier(input: &ItemTrait, carrier: &Path) -> syn::Result<()> {
     let name = &carrier.segments.last().unwrap().ident;
     let present = input.supertraits.iter().any(|bound| {
@@ -1520,7 +1520,7 @@ fn require_carrier(input: &ItemTrait, carrier: &Path) -> syn::Result<()> {
         Err(syn::Error::new_spanned(
             &input.ident,
             format!(
-                "trait_object needs `{name}` as a supertrait; write `trait {}: {name}`",
+                "dyn_shim_bind needs `{name}` as a supertrait; write `trait {}: {name}`",
                 input.ident
             ),
         ))
@@ -1603,13 +1603,13 @@ fn expand(
     // TODO: lift this gate. `build_boxed_method` already emits per-combo
     // `Box<dyn Shim + markers>` (that is how the `Clone` carrier supports
     // markers), so the blocker is only the forwarding side: a builder's reflexive
-    // impl forwards through the shared, combo-independent `@mount` entries, which
+    // impl forwards through the shared, combo-independent `@bind` entries, which
     // cannot pick a per-combo method. Lifting it means emitting suffixed shim
     // methods (`add`, `add_send`, ...) like `Clone`'s `__dyn_shim_clone_box`, and
-    // teaching the mount layer to route each combo's impl to the matching suffix
+    // teaching the bind layer to route each combo's impl to the matching suffix
     // — which `macro_rules!` cannot do today (it cannot derive a suffix ident
-    // from the `$($marker)*` tokens). That is a change to the mount machinery, not
-    // more sharing; see `build_mount_macro`.
+    // from the `$($marker)*` tokens). That is a change to the bind machinery, not
+    // more sharing; see `build_bind_macro`.
     if !reflexive.is_empty()
         && !autos.is_empty()
         && let Some(method) = items.iter().find_map(|item| match item {
@@ -1738,19 +1738,19 @@ fn expand(
     }
 
     // The forwarding bodies for each object form, computed once and shared by
-    // the mount macro and the `reflexive` invocations below. A form whose bodies
+    // the bind macro and the `reflexive` invocations below. A form whose bodies
     // do not type-check (a by-value `self` under `bare`, an unsupported receiver)
     // is an `Err`, deferred: it surfaces only if `reflexive` actually requests
     // that form, and is otherwise simply left out of the macro.
     let bare_entries = reflexive_entries(ObjectForm::Bare, &shim_name, items, reemit);
     let boxed_entries = reflexive_entries(ObjectForm::Boxed, &shim_name, items, reemit);
 
-    // Always emit the shim's mount macro (when any form is expressible), so a
-    // downstream `#[trait_object(Shim)]` can mount the source trait onto its own
+    // Always emit the shim's bind macro (when any form is expressible), so a
+    // downstream `#[dyn_shim_bind(Shim)]` can bind the source trait onto its own
     // principal even when this shim requested no reflexive impl of its own.
-    let mount_macro = build_mount_macro(&shim_name, source_ref, &bare_entries, &boxed_entries);
+    let bind_macro = build_bind_macro(&shim_name, source_ref, &bare_entries, &boxed_entries);
 
-    // When requested, mount the source trait onto the shim's own trait objects
+    // When requested, bind the source trait onto the shim's own trait objects
     // by invoking that macro, one form per requested kind and one call per marker
     // combination, so the shim's trait object satisfies the source trait. A
     // requested form that does not type-check reports its methods all at once
@@ -1799,7 +1799,7 @@ fn expand(
 
         #recognized_extra
 
-        #mount_macro
+        #bind_macro
 
         #reflexive_impl
     }
@@ -1885,10 +1885,10 @@ fn expand_recognized(
     let (sigs, impls, extra) = recognized.expand(shim, &combos);
     let impl_bound = recognized.impl_bound();
     let doc = recognized.doc_line(shim);
-    // The mount macro that backs `#[trait_object(Carrier)]`: stamps this
+    // The bind macro that backs `#[dyn_shim_bind(Carrier)]`: stamps this
     // capability's bridge impls onto an arbitrary principal that inherits the
     // carrier. Named after the carrier so the carrier's import carries it.
-    let mount_arm = recognized.mount_arm(shim);
+    let bind_arm = recognized.bind_arm(shim);
 
     quote! {
         #(#attrs)*
@@ -1908,8 +1908,8 @@ fn expand_recognized(
         #[macro_export]
         #[doc(hidden)]
         macro_rules! #shim {
-            (@mount ($principal:path) ($($marker:tt)*)) => {
-                #mount_arm
+            (@bind ($principal:path) ($($marker:tt)*)) => {
+                #bind_arm
             };
         }
     }
@@ -2401,7 +2401,7 @@ fn forward_boxed(
     let names = rename_args(&mut sig);
     // Box the forwarded source call into the shim object. No markers: a boxed
     // builder's reflexive impl forwards through the shared, combo-independent
-    // mount entries (unlike `Clone`'s dedicated per-combo bridge), so the
+    // bind entries (unlike `Clone`'s dedicated per-combo bridge), so the
     // marker-free `Box<dyn shim>` is all that path can satisfy — the marker
     // combination is rejected up front in `expand`.
     let call = quote! { <__T as #src>::#name(#self_expr #(, #names)*) };
@@ -2434,7 +2434,7 @@ fn forward_boxed(
 /// principal (they reference `self`/`&**self` and the shim's methods, with
 /// `Self` resolving to the impl's self type), so the same set serves the shim's
 /// own objects (the `reflexive` option) and any downstream principal that
-/// inherits the shim (`#[trait_object(Shim)]`).
+/// inherits the shim (`#[dyn_shim_bind(Shim)]`).
 ///
 /// A shim-provided method (see [`is_provided`]) is left out entirely: it is not
 /// a method of the source trait, so it has no place in `impl SourceTrait`.
@@ -2470,39 +2470,39 @@ fn reflexive_entries(
     }
 }
 
-/// Build the shim's mount macro: a `macro_rules!` named after the shim that
+/// Build the shim's bind macro: a `macro_rules!` named after the shim that
 /// stamps `impl SourceTrait for <object>`, forwarding through the shim. It backs
-/// both the `reflexive` option (mounting onto the shim's own `dyn`/`Box` types)
-/// and a downstream `#[trait_object(Shim)]` (mounting onto any principal that
+/// both the `reflexive` option (binding onto the shim's own `dyn`/`Box` types)
+/// and a downstream `#[dyn_shim_bind(Shim)]` (binding onto any principal that
 /// inherits the shim). The arms:
 ///
 /// - `@bare`/`@boxed` take a fully formed self type and stamp one form's impl;
 ///   the `reflexive` invocations use these, since they choose the form.
-/// - `@mount` takes a principal trait path plus the marker tokens of one
-///   combination and stamps every *expressible* form; `#[trait_object]` uses
+/// - `@bind` takes a principal trait path plus the marker tokens of one
+///   combination and stamps every *expressible* form; `#[dyn_shim_bind]` uses
 ///   this single uniform entry, shared with the recognized carriers.
 ///
 /// Only the forms whose forwarding bodies type-check are emitted. The macro is
-/// exported (so a downstream crate can mount through it) and named after the
+/// exported (so a downstream crate can bind through it) and named after the
 /// shim, so the shim's own import carries it (`use krate::Shim` brings the trait
 /// and the macro, which live in different namespaces). It is `#[doc(hidden)]`,
 /// and `#[allow(non_local_definitions)]` keeps it quiet when a shim is declared
 /// inside a function body (as a doctest's implicit `main` does).
-fn build_mount_macro(
+fn build_bind_macro(
     shim: &Ident,
     source_ref: &TokenStream2,
     bare: &syn::Result<Vec<TokenStream2>>,
     boxed: &syn::Result<Vec<TokenStream2>>,
 ) -> TokenStream2 {
     let mut arms = TokenStream2::new();
-    let mut mount_impls = TokenStream2::new();
+    let mut bind_impls = TokenStream2::new();
     if let Ok(entries) = bare {
         arms.extend(quote! {
             (@bare $self_ty:ty) => {
                 impl #source_ref for $self_ty { #(#entries)* }
             };
         });
-        mount_impls.extend(quote! {
+        bind_impls.extend(quote! {
             impl #source_ref for dyn $principal $($marker)* { #(#entries)* }
         });
     }
@@ -2512,13 +2512,13 @@ fn build_mount_macro(
                 impl #source_ref for $self_ty { #(#entries)* }
             };
         });
-        mount_impls.extend(quote! {
+        bind_impls.extend(quote! {
             impl #source_ref for ::std::boxed::Box<dyn $principal $($marker)*> { #(#entries)* }
         });
     }
     if arms.is_empty() {
         // Neither form forwards (every method is non-dyn-compatible without a
-        // stub or default), so there is nothing to mount and no macro to emit.
+        // stub or default), so there is nothing to bind and no macro to emit.
         return TokenStream2::new();
     }
     quote! {
@@ -2527,8 +2527,8 @@ fn build_mount_macro(
         #[doc(hidden)]
         macro_rules! #shim {
             #arms
-            (@mount ($principal:path) ($($marker:tt)*)) => {
-                #mount_impls
+            (@bind ($principal:path) ($($marker:tt)*)) => {
+                #bind_impls
             };
         }
     }
@@ -2832,7 +2832,7 @@ enum Helper {
 /// rather than forwarded to the source trait. Only in the foreign form: a
 /// [`macro@dyn_shim_foreign`] method with a default body is shim-local — the
 /// foreign trait need not declare it — so it is emitted verbatim on the shim
-/// trait and left out of the blanket impl, the reflexive impl, and the mount
+/// trait and left out of the blanket impl, the reflexive impl, and the bind
 /// macro. Its body calls the shim's other (forwarded) methods.
 ///
 /// In the local form a default body lives on the re-emitted source trait, where
