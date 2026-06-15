@@ -1506,22 +1506,43 @@ fn expand(
         recognized_extra.extend(extra);
     }
 
-    // When requested, also emit `impl SourceTrait for <shim object>` for each
-    // requested kind (and each marker combination), so the shim's trait object
-    // satisfies the source trait. If any method cannot be placed in a requested
-    // impl, every such method is reported at once and the reflexive impls are
-    // omitted, leaving the shim and blanket impl above to compile on their own
-    // rather than cascading into an "unimplemented trait items" error on
-    // generated code.
+    // The forwarding bodies for each object form, computed once and shared by
+    // the mount macro and the `reflexive` invocations below. A form whose bodies
+    // do not type-check (a by-value `self` under `bare`, an unsupported receiver)
+    // is an `Err`, deferred: it surfaces only if `reflexive` actually requests
+    // that form, and is otherwise simply left out of the macro.
+    let bare_entries = reflexive_entries(ObjectForm::Bare, &shim_name, items);
+    let boxed_entries = reflexive_entries(ObjectForm::Boxed, &shim_name, items);
+
+    // Always emit the shim's mount macro (when any form is expressible), so a
+    // downstream `#[trait_object(Shim)]` can mount the source trait onto its own
+    // principal even when this shim requested no reflexive impl of its own.
+    let mount_macro = build_mount_macro(&shim_name, source_ref, &bare_entries, &boxed_entries);
+
+    // When requested, mount the source trait onto the shim's own trait objects
+    // by invoking that macro, one form per requested kind and one call per marker
+    // combination, so the shim's trait object satisfies the source trait. A
+    // requested form that does not type-check reports its methods all at once
+    // (and the reflexive impls are omitted), rather than cascading into an
+    // "unimplemented trait items" error on generated code.
     let reflexive_impl = {
         let mut tokens = TokenStream2::new();
         let mut errors: Option<syn::Error> = None;
-        for kind in reflexive {
-            match build_reflexive(kind, &shim_name, source_ref, items, &combos) {
-                Ok(impls) => tokens.extend(impls),
+        for kind in &reflexive {
+            let (entries, tag) = match kind {
+                ObjectForm::Bare => (&bare_entries, quote! { @bare }),
+                ObjectForm::Boxed => (&boxed_entries, quote! { @boxed }),
+            };
+            match entries {
+                Ok(_) => {
+                    for MarkerCombo { markers, .. } in &combos {
+                        let self_ty = kind.ty(&shim_name, markers);
+                        tokens.extend(quote! { #shim_name! { #tag #self_ty } });
+                    }
+                }
                 Err(err) => match &mut errors {
-                    Some(acc) => acc.combine(err),
-                    None => errors = Some(err),
+                    Some(acc) => acc.combine(err.clone()),
+                    None => errors = Some(err.clone()),
                 },
             }
         }
@@ -1546,6 +1567,8 @@ fn expand(
         }
 
         #recognized_extra
+
+        #mount_macro
 
         #reflexive_impl
     }
@@ -1739,18 +1762,20 @@ fn forward(method: &TraitItemFn, src: &TokenStream2) -> (TokenStream2, TokenStre
     (shim_sig, shim_impl)
 }
 
-/// Build the reflexive `impl SourceTrait for <shim object>` blocks, one per
-/// marker combination. Each source method either forwards to the shim, gets a
-/// panicking stub (`#[dyn_shim(panic)]`), or is omitted to inherit a trait
-/// default body. Every method that cannot be placed is collected, so the
-/// caller reports them all in one pass.
-fn build_reflexive(
+/// Build the forwarding method bodies for an `impl SourceTrait for <shim
+/// object>` in one object form. Each source method either forwards to the shim,
+/// gets a panicking stub (`#[dyn_shim(panic)]`), or is omitted to inherit a
+/// trait default body. Every method that cannot be placed is collected, so the
+/// caller reports them all in one pass. The entries are independent of the
+/// principal (they reference `self`/`&**self` and the shim's methods, with
+/// `Self` resolving to the impl's self type), so the same set serves the shim's
+/// own objects (the `reflexive` option) and any downstream principal that
+/// inherits the shim (`#[trait_object(Shim)]`).
+fn reflexive_entries(
     kind: ObjectForm,
     shim: &Ident,
-    source_ref: &TokenStream2,
     items: &[TraitItem],
-    combos: &[MarkerCombo],
-) -> syn::Result<TokenStream2> {
+) -> syn::Result<Vec<TokenStream2>> {
     let mut entries = Vec::new();
     let mut errors: Option<syn::Error> = None;
     for item in items {
@@ -1768,20 +1793,74 @@ fn build_reflexive(
             },
         }
     }
-    if let Some(err) = errors {
-        return Err(err);
+    match errors {
+        Some(err) => Err(err),
+        None => Ok(entries),
     }
+}
 
-    let mut out = TokenStream2::new();
-    for MarkerCombo { markers, .. } in combos {
-        let self_ty = kind.ty(shim, markers);
-        out.extend(quote! {
-            impl #source_ref for #self_ty {
-                #(#entries)*
-            }
+/// Build the shim's mount macro: a `macro_rules!` named after the shim that
+/// stamps `impl SourceTrait for <object>`, forwarding through the shim. It backs
+/// both the `reflexive` option (mounting onto the shim's own `dyn`/`Box` types)
+/// and a downstream `#[trait_object(Shim)]` (mounting onto any principal that
+/// inherits the shim). The arms:
+///
+/// - `@bare`/`@boxed` take a fully formed self type and stamp one form's impl;
+///   the `reflexive` invocations use these, since they choose the form.
+/// - `@mount` takes a principal trait path plus the marker tokens of one
+///   combination and stamps every *expressible* form; `#[trait_object]` uses
+///   this single uniform entry, shared with the recognized carriers.
+///
+/// Only the forms whose forwarding bodies type-check are emitted. The macro is
+/// exported (so a downstream crate can mount through it) and named after the
+/// shim, so the shim's own import carries it (`use krate::Shim` brings the trait
+/// and the macro, which live in different namespaces). It is `#[doc(hidden)]`,
+/// and `#[allow(non_local_definitions)]` keeps it quiet when a shim is declared
+/// inside a function body (as a doctest's implicit `main` does).
+fn build_mount_macro(
+    shim: &Ident,
+    source_ref: &TokenStream2,
+    bare: &syn::Result<Vec<TokenStream2>>,
+    boxed: &syn::Result<Vec<TokenStream2>>,
+) -> TokenStream2 {
+    let mut arms = TokenStream2::new();
+    let mut mount_impls = TokenStream2::new();
+    if let Ok(entries) = bare {
+        arms.extend(quote! {
+            (@bare $self_ty:ty) => {
+                impl #source_ref for $self_ty { #(#entries)* }
+            };
+        });
+        mount_impls.extend(quote! {
+            impl #source_ref for dyn $principal $($marker)* { #(#entries)* }
         });
     }
-    Ok(out)
+    if let Ok(entries) = boxed {
+        arms.extend(quote! {
+            (@boxed $self_ty:ty) => {
+                impl #source_ref for $self_ty { #(#entries)* }
+            };
+        });
+        mount_impls.extend(quote! {
+            impl #source_ref for ::std::boxed::Box<dyn $principal $($marker)*> { #(#entries)* }
+        });
+    }
+    if arms.is_empty() {
+        // Neither form forwards (every method is non-dyn-compatible without a
+        // stub or default), so there is nothing to mount and no macro to emit.
+        return TokenStream2::new();
+    }
+    quote! {
+        #[allow(non_local_definitions)]
+        #[macro_export]
+        #[doc(hidden)]
+        macro_rules! #shim {
+            #arms
+            (@mount ($principal:path) ($($marker:tt)*)) => {
+                #mount_impls
+            };
+        }
+    }
 }
 
 /// Build one method of the reflexive impl. `Ok(Some(..))` is a method to emit,
