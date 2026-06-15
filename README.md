@@ -68,8 +68,10 @@ trait Widget: DynClone {
 
 ## Pass an erased value back into trait-generic code
 
-A `Box<dyn DynRule>` is not a `Rule`. The `reflexive` option makes it one, so it
-flows into functions written against the original trait:
+`Rule` below is not dyn-compatible — its generic `threshold` rules out `dyn Rule`
+— so a mixed set lives behind `Box<dyn DynRule>`. But a `Box<dyn DynRule>` is not
+a `Rule`. The `reflexive` option makes it one, so the erased value still flows
+into functions written against the original trait:
 
 ```rust
 use dyn_shim::dyn_shim;
@@ -77,13 +79,15 @@ use dyn_shim::dyn_shim;
 #[dyn_shim(DynRule, reflexive = bare + boxed)]
 trait Rule {
     fn check(&self, n: i32) -> bool;
+    #[dyn_shim(panic)]
+    fn threshold<T: From<i32>>(&self) -> T; // generic: rules out `dyn Rule`
 }
 
 fn passes(rule: &(impl Rule + ?Sized), n: i32) -> bool {
     rule.check(n)
 }
 
-// A &dyn DynRule satisfies Rule, so it can be passed to `passes`.
+// A &dyn DynRule satisfies Rule, so an erased rule can be passed to `passes`.
 ```
 
 The same machinery mounts a non-dyn-compatible trait onto a *different* trait
