@@ -22,8 +22,8 @@ dyn_clone = ["dyn_shim_macros/dyn_clone"]
 # recognized `Hash` bound add `DynHash` as a supertrait of the shim.
 dyn_hash = ["dyn_shim_macros/dyn_hash"]
 
-# Feature-gated items (`DynClone`, `DynHash`, `dyn_shim_bind`) should appear in
-# the published docs, so build them with every feature on.
+# Feature-gated items (`DynClone`, `DynHash`) should appear in the published
+# docs, so build them with every feature on.
 [package.metadata.docs.rs]
 all-features = true
 

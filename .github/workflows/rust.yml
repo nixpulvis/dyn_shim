@@ -16,8 +16,8 @@ jobs:
 
     strategy:
       matrix:
-        # `DynClone`, `DynHash`, and `dyn_shim_bind` are feature-gated, so cover
-        # no features, each on its own, and both together.
+        # `DynClone` and `DynHash` are feature-gated, so cover no features, each
+        # on its own, and both together.
         features:
           - ""
           - "dyn_clone"
