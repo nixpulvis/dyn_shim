@@ -1,0 +1,5 @@
+error: name the carrier trait, not the capability: write `DynClone` / `DynHash` (gated on the `dyn_clone` / `dyn_hash` feature) and inherit it as a supertrait
+ --> tests/ui/trait_object_capability_name.rs:6:16
+  |
+6 | #[trait_object(Clone)]
+  |                ^^^^^

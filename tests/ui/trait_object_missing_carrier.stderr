@@ -1,5 +1,5 @@
-error: trait_object(Hash) needs `DynHash` as a supertrait; write `trait Foo: DynHash`
- --> tests/ui/trait_object_missing_carrier.rs:7:7
+error: trait_object needs `DynHash` as a supertrait; write `trait Foo: DynHash`
+ --> tests/ui/trait_object_missing_carrier.rs:8:7
   |
-7 | trait Foo {
+8 | trait Foo {
   |       ^^^

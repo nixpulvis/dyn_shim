@@ -212,6 +212,42 @@ impl RecognizedBound {
         }
     }
 
+    /// The body of the `@mount` arm of this carrier's mount macro: the bridge
+    /// impls that put the capability on `dyn $principal $($marker)*`, forwarding
+    /// through the carrier the way `#[trait_object]` does. `$principal` and
+    /// `$marker` are emitted as literal metavariables for the surrounding
+    /// `macro_rules!` to bind; `carrier` is the carrier trait whose inherited
+    /// method does the erased work (the shim this macro is generated for).
+    ///
+    /// `Clone` reconstructs `Box<dyn $principal>` from the concrete value with
+    /// the fat-pointer splice in `__clone_box` (there is no blanket impl to clone
+    /// through here, unlike a recognized bound). `Hash` forwards through the
+    /// carrier's `__dyn_shim_hash`, which erases the generic hasher.
+    fn mount_arm(self, carrier: &Ident) -> TokenStream2 {
+        match self {
+            RecognizedBound::Clone => quote! {
+                impl ::std::clone::Clone for ::std::boxed::Box<dyn $principal $($marker)*> {
+                    fn clone(&self) -> Self {
+                        $crate::__clone_box(&**self)
+                    }
+                }
+                impl ::std::borrow::ToOwned for dyn $principal $($marker)* {
+                    type Owned = ::std::boxed::Box<dyn $principal $($marker)*>;
+                    fn to_owned(&self) -> Self::Owned {
+                        $crate::__clone_box(self)
+                    }
+                }
+            },
+            RecognizedBound::Hash => quote! {
+                impl ::std::hash::Hash for dyn $principal $($marker)* {
+                    fn hash<__H: ::std::hash::Hasher>(&self, state: &mut __H) {
+                        <Self as #carrier>::__dyn_shim_hash(self, state)
+                    }
+                }
+            },
+        }
+    }
+
     /// Generate the machinery for one recognized bound: hidden method
     /// signatures for the shim trait, their bodies for the blanket impl, and
     /// the standalone trait impls emitted after both.
@@ -1215,9 +1251,13 @@ impl ClassifiedBounds {
 }
 
 /// Expansion for [`macro@trait_object`]: re-emit the annotated trait unchanged
-/// and append the impls that make its `dyn` objects `Clone`/`Hash`. The carrier
-/// methods are inherited from the `DynClone`/`DynHash` supertraits, so unlike
-/// the recognized-bound machinery this emits only the bridge impls.
+/// and mount each listed carrier onto its `dyn` objects by invoking that
+/// carrier's generated mount macro. A carrier is any trait the annotated trait
+/// inherits whose mount macro stamps `impl Target for dyn Trait` — the shipped
+/// `DynClone`/`DynHash`, or a `#[dyn_shim]` shim. Auto traits in the list are
+/// markers selecting the covered `dyn` variants, exactly as for a recognized
+/// bound. This emits no impls itself; the linking lives entirely in the
+/// carriers' macros, shared with the `reflexive` option.
 fn expand_trait_object(
     input: &ItemTrait,
     bounds: Punctuated<TypeParamBound, Token![+]>,
@@ -1226,114 +1266,99 @@ fn expand_trait_object(
         return err;
     }
 
-    let ClassifiedBounds {
-        recognized,
-        autos,
-        passthrough,
-        rejected,
-        ..
-    } = ClassifiedBounds::classify(&bounds);
-    if let Some((bound, msg)) = rejected.into_iter().next() {
-        return syn::Error::new_spanned(bound, msg)
-            .to_compile_error()
-            .into();
+    // Split the list: auto traits are markers, every other bound is a carrier to
+    // mount (named by its mount macro). A bare `Clone`/`Hash` is the old surface,
+    // which named the capability; point it at the carrier trait instead.
+    let mut carriers: Vec<Path> = Vec::new();
+    let mut autos: Vec<AutoTrait> = Vec::new();
+    for bound in &bounds {
+        match Classified::of(bound) {
+            Classified::Auto(auto) => {
+                if !autos.contains(&auto) {
+                    autos.push(auto);
+                }
+            }
+            Classified::Recognized(_) => {
+                return syn::Error::new_spanned(
+                    bound,
+                    "name the carrier trait, not the capability: write `DynClone` / `DynHash` \
+                     (gated on the `dyn_clone` / `dyn_hash` feature) and inherit it as a supertrait",
+                )
+                .to_compile_error()
+                .into();
+            }
+            _ => {
+                let Some(path) = plain_trait_bound(bound) else {
+                    return syn::Error::new_spanned(
+                        bound,
+                        "a carrier must be a plain trait path (no `?`, no higher-ranked binder)",
+                    )
+                    .to_compile_error()
+                    .into();
+                };
+                carriers.push(path.clone());
+            }
+        }
     }
-    if let Some(bound) = passthrough.first() {
-        return syn::Error::new_spanned(
-            bound,
-            "trait_object expects recognized traits (`Clone` or `Hash`), optionally \
-             followed by auto-trait markers",
-        )
-        .to_compile_error()
-        .into();
-    }
-    if recognized.is_empty() {
+    if carriers.is_empty() {
         return syn::Error::new_spanned(
             &bounds,
-            "trait_object expects at least one recognized trait (`Clone` or `Hash`)",
+            "trait_object expects at least one carrier trait to mount (`DynClone`, `DynHash`, \
+             or a `#[dyn_shim]` shim), optionally followed by auto-trait markers",
         )
         .to_compile_error()
         .into();
     }
 
-    // Each recognized capability rides on a carrier supertrait the annotated
-    // trait must already inherit. Report a missing one here, at the attribute,
-    // rather than letting the bridge's call to the inherited method fail to
-    // compile on generated code.
-    for k in &recognized {
-        if let Err(err) = k.require_carrier(input) {
+    // Each carrier must be inherited as a supertrait, so `dyn Trait: Carrier`
+    // holds and the mounted impl's forwarding body type-checks. Report a missing
+    // one here, at the attribute, rather than as a macro-not-found or
+    // trait-bound error on generated code.
+    for carrier in &carriers {
+        if let Err(err) = require_carrier(input, carrier) {
             return err.to_compile_error().into();
         }
     }
 
     let trait_ident = &input.ident;
     let combos = MarkerCombo::all(&autos);
-    let mut bridges = TokenStream2::new();
-    for k in &recognized {
-        bridges.extend(k.trait_object_bridge(trait_ident, &combos));
+    let mut mounts = TokenStream2::new();
+    for carrier in &carriers {
+        for MarkerCombo { markers, .. } in &combos {
+            mounts.extend(quote! {
+                #carrier! { @mount (#trait_ident) ( #markers ) }
+            });
+        }
     }
 
     quote! {
         #input
-        #bridges
+        #mounts
     }
     .into()
 }
 
-impl RecognizedBound {
-    /// Check that the annotated trait inherits the carrier supertrait this
-    /// capability needs (`DynClone` for `Clone`, `DynHash` for `Hash`). A
-    /// bare-name token match, like [`Classified::of`].
-    fn require_carrier(self, input: &ItemTrait) -> syn::Result<()> {
-        let (carrier, capability) = match self {
-            RecognizedBound::Clone => ("DynClone", "Clone"),
-            RecognizedBound::Hash => ("DynHash", "Hash"),
-        };
-        let present = input.supertraits.iter().any(|bound| {
-            plain_trait_bound(bound)
-                .and_then(|path| path.segments.last())
-                .is_some_and(|seg| seg.ident == carrier)
-        });
-        if present {
-            Ok(())
-        } else {
-            Err(syn::Error::new_spanned(
-                &input.ident,
-                format!(
-                    "trait_object({capability}) needs `{carrier}` as a supertrait; \
-                     write `trait {}: {carrier}`",
-                    input.ident
-                ),
-            ))
-        }
-    }
-
-    /// The bridge impls for this capability on `dyn TraitIdent + markers`, one
-    /// per marker combination. Each forwards to the carrier method inherited
-    /// from the `DynClone`/`DynHash` supertrait.
-    fn trait_object_bridge(self, trait_ident: &Ident, combos: &[MarkerCombo]) -> TokenStream2 {
-        let mut out = TokenStream2::new();
-        match self {
-            // `Hash` forwards through the inherited `DynHash` carrier, which
-            // erases the generic hasher to `&mut dyn Hasher`.
-            RecognizedBound::Hash => {
-                let carrier = quote! { ::dyn_shim::DynHash };
-                for MarkerCombo { markers, .. } in combos {
-                    out.extend(hash_bridge(trait_ident, markers, &carrier));
-                }
-            }
-            // `Clone` clones the concrete value into a fresh `Box<dyn Trait>`
-            // through `__clone_box`. Unlike the recognized-bound path there is no
-            // blanket impl to clone through, so it uses the fat-pointer carrier.
-            RecognizedBound::Clone => {
-                for MarkerCombo { markers, .. } in combos {
-                    out.extend(clone_bridge(trait_ident, markers, |recv| {
-                        quote! { ::dyn_shim::__clone_box(#recv) }
-                    }));
-                }
-            }
-        }
-        out
+/// Check that the annotated trait inherits `carrier` as a supertrait, matched by
+/// the carrier path's last segment (a bare-name token match, like
+/// [`Classified::of`]). Without it, `dyn Trait: Carrier` would not hold and the
+/// mounted impl's forwarding call would fail to compile on generated code.
+fn require_carrier(input: &ItemTrait, carrier: &Path) -> syn::Result<()> {
+    let name = &carrier.segments.last().unwrap().ident;
+    let present = input.supertraits.iter().any(|bound| {
+        plain_trait_bound(bound)
+            .and_then(|path| path.segments.last())
+            .is_some_and(|seg| &seg.ident == name)
+    });
+    if present {
+        Ok(())
+    } else {
+        Err(syn::Error::new_spanned(
+            &input.ident,
+            format!(
+                "trait_object needs `{name}` as a supertrait; write `trait {}: {name}`",
+                input.ident
+            ),
+        ))
     }
 }
 
@@ -1654,6 +1679,10 @@ fn expand_recognized(
     let (sigs, impls, extra) = recognized.expand(shim, &combos);
     let impl_bound = recognized.impl_bound();
     let doc = recognized.doc_line(shim);
+    // The mount macro that backs `#[trait_object(Carrier)]`: stamps this
+    // capability's bridge impls onto an arbitrary principal that inherits the
+    // carrier. Named after the carrier so the carrier's import carries it.
+    let mount_arm = recognized.mount_arm(shim);
 
     quote! {
         #(#attrs)*
@@ -1668,6 +1697,15 @@ fn expand_recognized(
         }
 
         #extra
+
+        #[allow(non_local_definitions)]
+        #[macro_export]
+        #[doc(hidden)]
+        macro_rules! #shim {
+            (@mount ($principal:path) ($($marker:tt)*)) => {
+                #mount_arm
+            };
+        }
     }
     .into()
 }

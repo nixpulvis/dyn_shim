@@ -24,7 +24,7 @@
 //! The `dyn_shim` version keeps the trait, its `DynHash` supertrait, and the
 //! `dyn MyTrait` type unchanged. Two things move: the import points at
 //! `dyn_shim`, and the separate `hash_trait_object!(MyTrait)` call becomes a
-//! `#[trait_object(Hash)]` attribute on the trait. `dyn MyTrait` then implements
+//! `#[trait_object(DynHash)]` attribute on the trait. `dyn MyTrait` then implements
 //! `Hash`, covering `Box<dyn MyTrait>` through the standard library's forwarding
 //! impl, so the `Container` derive works as before.
 //!
@@ -33,7 +33,7 @@
 use dyn_shim::{DynHash, trait_object};
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 
-#[trait_object(Hash)]
+#[trait_object(DynHash)]
 trait MyTrait: DynHash {
     fn recite(&self);
 }

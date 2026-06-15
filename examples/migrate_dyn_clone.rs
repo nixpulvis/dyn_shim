@@ -28,7 +28,7 @@
 //!
 //! The `dyn_shim` version keeps the trait, its `DynClone` supertrait, and the
 //! `dyn MyTrait` type unchanged. Two things move: the import points at
-//! `dyn_shim`, and `#[trait_object(Clone)]` on the trait stands in for the
+//! `dyn_shim`, and `#[trait_object(DynClone)]` on the trait stands in for the
 //! `clone_trait_object!` call. The attribute makes `Box<dyn MyTrait>` implement
 //! `Clone`, so `dyn_clone::clone_box(&*x)` becomes `x.clone()`; it also gives
 //! `dyn MyTrait` a `ToOwned` impl, so `(&*x).to_owned()` is the direct
@@ -38,7 +38,7 @@
 
 use dyn_shim::{DynClone, trait_object};
 
-#[trait_object(Clone)]
+#[trait_object(DynClone)]
 trait MyTrait: DynClone {
     fn recite(&self);
 }
@@ -55,7 +55,7 @@ fn main() {
     let x: Box<dyn MyTrait> = Box::new(String::from(line));
     x.recite();
 
-    // Using #[trait_object(Clone)] let's us call .clone here directly.
+    // Using #[trait_object(DynClone)] let's us call .clone here directly.
     let x2 = x.clone();
     x2.recite();
 }

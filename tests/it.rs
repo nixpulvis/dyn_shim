@@ -2,7 +2,7 @@
 // purpose, to exercise lifetime forwarding.
 #![allow(clippy::needless_lifetimes)]
 
-use dyn_shim::{dyn_shim, dyn_shim_foreign, dyn_shim_recognized};
+use dyn_shim::{dyn_shim, dyn_shim_foreign, dyn_shim_recognized, trait_object};
 use std::fmt::Display;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -912,7 +912,7 @@ mod trait_object_hash {
     use dyn_shim::{DynHash, trait_object};
     use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 
-    #[trait_object(Hash)]
+    #[trait_object(DynHash)]
     trait Tagged: DynHash {
         fn tag(&self) -> u32;
     }
@@ -947,7 +947,7 @@ mod trait_object_hash {
 mod trait_object_clone {
     use dyn_shim::{DynClone, trait_object};
 
-    #[trait_object(Clone)]
+    #[trait_object(DynClone)]
     trait Drawing: DynClone {
         fn area(&self) -> u32;
     }
@@ -988,6 +988,66 @@ mod trait_object_clone {
     }
 }
 
+// `#[trait_object(DynRecipe)]` mounts a `#[dyn_shim]` shim's source trait onto a
+// *different* dyn-compatible trait the user owns. `Recipe` is not dyn-compatible
+// (its `portion` method is generic), so it cannot be a supertrait of `Dish`.
+// Instead `Dish` inherits the generated `DynRecipe` shim, and the attribute
+// invokes the shim's mount macro to emit `impl Recipe for dyn Dish` and
+// `impl Recipe for Box<dyn Dish>`, forwarding the dyn-compatible methods through
+// the shim. So a `&dyn Dish` and an owned `Box<dyn Dish>` each satisfy `Recipe`,
+// even though `dyn Dish` carries it through the `DynRecipe` carrier, not as a
+// supertrait of `Recipe` itself.
+#[dyn_shim(DynRecipe)]
+trait Recipe {
+    fn calories(&self) -> u32;
+    fn scaled(&self, factor: u32) -> u32;
+    #[dyn_shim(panic)]
+    fn portion<U: From<u32>>(&self) -> U; // generic: not dyn-compatible
+}
+
+#[trait_object(DynRecipe)]
+trait Dish: DynRecipe {
+    fn name(&self) -> &str;
+}
+
+struct Pasta;
+impl Recipe for Pasta {
+    fn calories(&self) -> u32 {
+        400
+    }
+    fn scaled(&self, factor: u32) -> u32 {
+        400 * factor
+    }
+    fn portion<U: From<u32>>(&self) -> U {
+        U::from(Recipe::calories(self))
+    }
+}
+impl Dish for Pasta {
+    fn name(&self) -> &str {
+        "pasta"
+    }
+}
+
+fn total(r: &(impl Recipe + ?Sized)) -> u32 {
+    r.calories()
+}
+fn consume(r: impl Recipe) -> u32 {
+    r.scaled(2)
+}
+
+#[test]
+fn trait_object_mounts_shim_source_onto_principal() {
+    let dish: Box<dyn Dish> = Box::new(Pasta);
+    assert_eq!(dish.name(), "pasta"); // Dish's own method still works
+    // `&dyn Dish` satisfies `Recipe` by reference (the bare mount).
+    assert_eq!(total(&*dish), 400);
+    // The generic `portion` lives only on the concrete type (it is a panicking
+    // stub on the erased mount); call it before erasing.
+    assert_eq!(Recipe::portion::<u32>(&Pasta), 400);
+    // `Box<dyn Dish>` satisfies `Recipe` by value (the boxed mount).
+    assert_eq!(consume(dish), 800);
+}
+
 // Hash and Clone combine in one attribute, and listed auto traits select the
 // covered `dyn` marker variants, exactly as for a recognized bound.
 #[cfg(all(feature = "dyn_clone", feature = "dyn_hash"))]
@@ -995,7 +1055,7 @@ mod trait_object_combined {
     use dyn_shim::{DynClone, DynHash, trait_object};
     use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 
-    #[trait_object(Hash + Clone + Send + Sync)]
+    #[trait_object(DynHash + DynClone + Send + Sync)]
     trait Node: DynHash + DynClone {
         fn id(&self) -> u32;
     }

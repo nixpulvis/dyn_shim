@@ -1,5 +1,0 @@
-error: trait_object expects recognized traits (`Clone` or `Hash`), optionally followed by auto-trait markers
- --> tests/ui/trait_object_passthrough.rs:5:16
-  |
-5 | #[trait_object(Iterator)]
-  |                ^^^^^^^^

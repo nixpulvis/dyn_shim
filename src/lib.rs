@@ -38,10 +38,10 @@
 
 pub use dyn_shim_macros::{dyn_shim, dyn_shim_foreign};
 
-// `trait_object` only implements `Clone`/`Hash`, whose carriers are `DynClone`
-// and `DynHash`. With neither feature on there is no carrier to bolt onto a
-// trait, so the attribute would be unusable; gate it on having at least one.
-#[cfg(any(feature = "dyn_clone", feature = "dyn_hash"))]
+// `trait_object` mounts any carrier onto a trait's objects — a `#[dyn_shim]`
+// shim, or the shipped `DynClone`/`DynHash` (those two behind their features).
+// A shim carrier needs no feature, so the attribute is always available; the
+// `DynClone`/`DynHash` carriers it can name simply do not exist without them.
 pub use dyn_shim_macros::trait_object;
 
 // The machinery behind the ready-made shims below. It is not part of this

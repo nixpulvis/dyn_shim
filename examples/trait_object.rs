@@ -7,7 +7,7 @@
 //! shim, but here `dyn Widget` is the type used directly, so generating a second
 //! trait is not wanted.
 //!
-//! `#[trait_object(Hash + Clone)]` adds the impls in place instead. The trait
+//! `#[trait_object(DynHash + DynClone)]` adds the impls in place instead. The trait
 //! carries `DynHash` and `DynClone` as supertraits to hold the machinery, and
 //! the attribute makes `dyn Widget` implement `Hash` and `Box<dyn Widget>`
 //! implement `Clone`. Because the carriers are supertraits, every `Widget`
@@ -18,7 +18,7 @@
 use dyn_shim::{DynClone, DynHash, trait_object};
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 
-#[trait_object(Hash + Clone)]
+#[trait_object(DynHash + DynClone)]
 trait Widget: DynHash + DynClone {
     fn render(&self) -> String;
 }
