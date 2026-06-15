@@ -2355,11 +2355,19 @@ fn forward_boxed(
              can be boxed into the shim's trait object",
         ));
     }
+    // TODO: support `boxed` + `erase` together, for a generic `-> Self` builder
+    // such as `fn with<T: Into<X>>(self, t: T) -> Self`. A method carries one
+    // `#[dyn_shim(...)]` helper today, and the two transforms are applied by
+    // separate forwarders (`forward_erased` / `forward_boxed`). Composing them is
+    // mechanical — they touch disjoint parts of the signature (erase rewrites the
+    // arguments and generics, boxing rewrites the return) — but needs a way to
+    // request both on one method and a single forwarder that runs `erase_generic`
+    // and then boxes the result.
     if has_type_or_const_generics(&method.sig) {
         return Err(syn::Error::new_spanned(
             &method.sig.ident,
-            "#[dyn_shim(boxed)] cannot apply to a generic method (combine with `erase` is not \
-             yet supported)",
+            "#[dyn_shim(boxed)] cannot apply to a generic method (combining it with `erase` is \
+             not yet supported)",
         ));
     }
     for arg in method.sig.inputs.iter().skip(1) {
