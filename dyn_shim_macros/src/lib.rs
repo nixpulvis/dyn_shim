@@ -1124,11 +1124,51 @@ pub fn dyn_shim(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// signature that does not match the real one is caught when the generated
 /// `<T as other_crate::Sink>::method(..)` call fails to compile.
 ///
+/// # Provided methods
+///
+/// A restated method with a **default body** is not forwarded: it is provided by
+/// the shim itself, emitted verbatim, with its body calling the shim's forwarded
+/// methods. Use it to add a convenience method that the foreign trait does not
+/// declare — the macro generates no `<T as Source>::method` call for it, so the
+/// foreign trait needs no counterpart:
+///
+/// ```
+/// use dyn_shim::dyn_shim_foreign;
+///
+/// mod other_crate {
+///     pub trait Sink {
+///         fn total(&self) -> usize;
+///     }
+/// }
+///
+/// #[dyn_shim_foreign(other_crate::Sink)]
+/// trait DynSink {
+///     fn total(&self) -> usize;       // forwarded to `other_crate::Sink::total`
+///     fn doubled(&self) -> usize {    // provided: not on `Sink`, computed here
+///         self.total() * 2
+///     }
+/// }
+///
+/// struct Buf(usize);
+/// impl other_crate::Sink for Buf {
+///     fn total(&self) -> usize { self.0 }
+/// }
+///
+/// let s: Box<dyn DynSink> = Box::new(Buf(4));
+/// assert_eq!(s.doubled(), 8);
+/// ```
+///
+/// (In [`macro@dyn_shim`] a default body instead lives on the re-emitted source
+/// trait and is forwarded like any other method, so an implementor's override is
+/// still honored; only the foreign form, which has no source trait to hold it,
+/// provides the body on the shim.)
+///
 /// The trailing `reflexive = bare | boxed` argument
 /// (`#[dyn_shim_foreign(other_crate::Sink, reflexive = boxed)]`) and the
 /// `#[dyn_shim(panic)]` method helper work here too, emitting `impl
 /// other_crate::Sink for Box<dyn DynSink>` so the boxed shim satisfies the
-/// foreign trait. See [reflexive impl](macro@dyn_shim#reflexive-impl).
+/// foreign trait; a provided method is left out of that impl, since it is not a
+/// method of the foreign trait. See [reflexive impl](macro@dyn_shim#reflexive-impl).
 ///
 /// [method selection]: macro@dyn_shim#method-selection
 /// [bounds]: macro@dyn_shim#bounds
@@ -1606,6 +1646,14 @@ fn expand(
         };
         match skip(method) {
             Some(reason) => skipped.push((method.sig.ident.to_string(), reason)),
+            // A foreign-shim method with a default body is shim-local: emit it
+            // verbatim (minus our helper attrs) so the shim trait carries it,
+            // and add no forwarding impl — the blanket impl inherits the default.
+            None if is_provided(method, reemit) => {
+                let mut provided = method.clone();
+                provided.attrs.retain(|a| !a.path().is_ident("dyn_shim"));
+                sigs.push(quote! { #provided });
+            }
             None => match forward(method, &shim_name, source_ref) {
                 Ok((sig, body)) => {
                     sigs.push(sig);
@@ -1675,8 +1723,8 @@ fn expand(
     // do not type-check (a by-value `self` under `bare`, an unsupported receiver)
     // is an `Err`, deferred: it surfaces only if `reflexive` actually requests
     // that form, and is otherwise simply left out of the macro.
-    let bare_entries = reflexive_entries(ObjectForm::Bare, &shim_name, items);
-    let boxed_entries = reflexive_entries(ObjectForm::Boxed, &shim_name, items);
+    let bare_entries = reflexive_entries(ObjectForm::Bare, &shim_name, items, reemit);
+    let boxed_entries = reflexive_entries(ObjectForm::Boxed, &shim_name, items, reemit);
 
     // Always emit the shim's mount macro (when any form is expressible), so a
     // downstream `#[trait_object(Shim)]` can mount the source trait onto its own
@@ -2360,10 +2408,14 @@ fn forward_boxed(
 /// `Self` resolving to the impl's self type), so the same set serves the shim's
 /// own objects (the `reflexive` option) and any downstream principal that
 /// inherits the shim (`#[trait_object(Shim)]`).
+///
+/// A shim-provided method (see [`is_provided`]) is left out entirely: it is not
+/// a method of the source trait, so it has no place in `impl SourceTrait`.
 fn reflexive_entries(
     kind: ObjectForm,
     shim: &Ident,
     items: &[TraitItem],
+    reemit: bool,
 ) -> syn::Result<Vec<TokenStream2>> {
     let mut entries = Vec::new();
     let mut errors: Option<syn::Error> = None;
@@ -2371,6 +2423,9 @@ fn reflexive_entries(
         let TraitItem::Fn(method) = item else {
             continue;
         };
+        if is_provided(method, reemit) {
+            continue;
+        }
         match reflexive_method(kind, shim, method) {
             Ok(Some(entry)) => entries.push(entry),
             // A non-forwardable method with a default body is left off the
@@ -2724,6 +2779,20 @@ enum Helper {
     /// `Self` is the boxed object). See [`forward_boxed`]; this is the general
     /// case of the boxing the recognized `Clone` bound applies to `clone`.
     Boxed,
+}
+
+/// A shim method that carries its own body, so it is *provided* by the shim
+/// rather than forwarded to the source trait. Only in the foreign form: a
+/// [`macro@dyn_shim_foreign`] method with a default body is shim-local — the
+/// foreign trait need not declare it — so it is emitted verbatim on the shim
+/// trait and left out of the blanket impl, the reflexive impl, and the mount
+/// macro. Its body calls the shim's other (forwarded) methods.
+///
+/// In the local form a default body lives on the re-emitted source trait, where
+/// forwarding still honors an implementor's override, so a defaulted method is
+/// forwarded like any other and this returns `false`.
+fn is_provided(method: &TraitItemFn, reemit: bool) -> bool {
+    !reemit && method.default.is_some()
 }
 
 /// If a method cannot be dispatched through a trait object, return a short

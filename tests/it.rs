@@ -1209,3 +1209,84 @@ mod boxed_builder {
         assert_eq!(run(erased), 7);
     }
 }
+
+// A default body for an UNFORWARDABLE method works through a reflexive impl: the
+// method is not dyn-compatible, so it is skipped from the shim and omitted from
+// the reflexive impl, which inherits the source trait's default. The default
+// runs on the erased value, calling the forwarded methods through the shim.
+#[dyn_shim(DynMeter, reflexive = boxed)]
+trait Meter {
+    fn reading(&self) -> i32;
+    // Generic, so not dyn-compatible: skipped from `DynMeter`. Its default body
+    // is inherited by `impl Meter for Box<dyn DynMeter>` rather than stubbed.
+    fn scaled<T: From<i32>>(&self) -> T {
+        T::from(self.reading())
+    }
+}
+
+struct Sensor(i32);
+impl Meter for Sensor {
+    fn reading(&self) -> i32 {
+        self.0
+    }
+}
+
+#[test]
+fn reflexive_inherits_default_for_unforwardable() {
+    let m: Box<dyn DynMeter> = Box::new(Sensor(6));
+    // `scaled` is not on `DynMeter`, but `Box<dyn DynMeter>: Meter` inherits the
+    // default, which dispatches `reading` back through the shim.
+    let doubled: i64 = m.scaled();
+    assert_eq!(doubled, 6);
+}
+
+// A `#[dyn_shim_foreign]` shim may add a method with a default body that the
+// foreign trait does not declare: it is provided by the shim (computed from the
+// forwarded methods) instead of forwarded, so it needs no counterpart on the
+// foreign trait. `reflexive = boxed` still works — the provided method is left
+// out of `impl Foreign for Box<dyn Shim>`, which only restates foreign methods.
+mod foreign_default {
+    use dyn_shim::dyn_shim_foreign;
+
+    mod upstream {
+        pub trait Sink {
+            fn total(&self) -> usize;
+        }
+    }
+
+    #[dyn_shim_foreign(upstream::Sink, reflexive = boxed)]
+    trait DynSink {
+        fn total(&self) -> usize;
+        // Shim-local: not a method of `upstream::Sink`. Its default forwards
+        // through the shim's `total`.
+        fn doubled(&self) -> usize {
+            self.total() * 2
+        }
+    }
+
+    struct Buf(usize);
+    impl upstream::Sink for Buf {
+        fn total(&self) -> usize {
+            self.0
+        }
+    }
+
+    #[test]
+    fn provided_default_on_shim() {
+        let s: Box<dyn DynSink> = Box::new(Buf(4));
+        assert_eq!(s.total(), 4);
+        assert_eq!(s.doubled(), 8); // provided default, callable on the erased value
+    }
+
+    fn use_sink(s: impl upstream::Sink) -> usize {
+        s.total()
+    }
+
+    #[test]
+    fn boxed_still_satisfies_foreign_trait() {
+        // The reflexive impl omits the provided `doubled`, so `Box<dyn DynSink>`
+        // satisfies `upstream::Sink` (which has only `total`).
+        let s: Box<dyn DynSink> = Box::new(Buf(9));
+        assert_eq!(use_sink(s), 9);
+    }
+}

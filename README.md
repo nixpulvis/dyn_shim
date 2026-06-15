@@ -122,6 +122,12 @@ trait DynSink: Clone {
 // Box<dyn DynSink> holds any Clone implementor of other_crate::Sink.
 ```
 
+A restated method given a default body is *provided* by the shim rather than
+forwarded, so you can add a convenience method the foreign trait does not
+declare (its body calls the forwarded methods). In a `#[dyn_shim]` shim a default
+body instead lives on the source trait and is forwarded, honoring an
+implementor's override.
+
 ## Documentation
 
 The [API documentation](https://docs.rs/dyn_shim) covers the full
