@@ -34,6 +34,12 @@ trait Parser {
 let parsers: Vec<Box<dyn DynParser>> = Vec::new();
 ```
 
+A method that is non-dyn-compatible only because of a generic argument can be
+kept instead of skipped with `#[dyn_shim(erase)]`, which lowers a parameter
+bounded by one trait and used behind a reference to a trait object (`&mut impl
+Write` becomes `&mut dyn Write`). It is the same erasure the recognized `Hash`
+bound applies to `Hash::hash`'s generic hasher.
+
 ## Make trait objects `Clone` or `Hash`
 
 `Clone` and `Hash` cannot be supertraits of a dyn-compatible trait. List them as

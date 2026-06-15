@@ -1,4 +1,4 @@
-error: unsupported dyn_shim argument, expected `skip` or `panic`
+error: unsupported dyn_shim argument, expected `skip`, `panic`, or `erase`
  --> tests/ui/attr_unknown_arg.rs:7:16
   |
 7 |     #[dyn_shim(skpi)]

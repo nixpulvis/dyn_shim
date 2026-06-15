@@ -1094,3 +1094,59 @@ mod trait_object_combined {
         assert_eq!(sync.clone().id(), 4);
     }
 }
+
+// `#[dyn_shim(erase)]` lowers a generic argument — bounded by a single trait and
+// used only behind a reference — to `&mut dyn Bound`, so the method enters the
+// shim's vtable instead of being skipped as non-dyn-compatible. A named
+// `<W: Write>` parameter and an argument-position `impl Write` erase the same
+// way; forwarding reborrows the argument so the source method's `W` re-infers to
+// the sized `&mut dyn Write` (sound because std provides `impl Write for &mut W`).
+mod erase_generic_arg {
+    use dyn_shim::dyn_shim;
+    use std::io::Write;
+
+    #[dyn_shim(DynLogger)]
+    trait Logger {
+        fn label(&self) -> &str;
+
+        #[dyn_shim(erase)]
+        fn write_named<W: Write>(&self, out: &mut W);
+
+        #[dyn_shim(erase)]
+        fn write_apit(&self, out: &mut impl Write);
+    }
+
+    struct Tagged(&'static str);
+    impl Logger for Tagged {
+        fn label(&self) -> &str {
+            self.0
+        }
+        fn write_named<W: Write>(&self, out: &mut W) {
+            write!(out, "[{}]", self.0).unwrap();
+        }
+        fn write_apit(&self, out: &mut impl Write) {
+            write!(out, "<{}>", self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn erased_generic_dispatches_through_dyn() {
+        let logger: Box<dyn DynLogger> = Box::new(Tagged("svc"));
+        assert_eq!(logger.label(), "svc");
+
+        let mut buf: Vec<u8> = Vec::new();
+        logger.write_named(&mut buf);
+        logger.write_apit(&mut buf);
+        assert_eq!(String::from_utf8(buf).unwrap(), "[svc]<svc>");
+    }
+
+    #[test]
+    fn heterogeneous_collection_calls_erased_method() {
+        let loggers: Vec<Box<dyn DynLogger>> = vec![Box::new(Tagged("a")), Box::new(Tagged("b"))];
+        let mut buf: Vec<u8> = Vec::new();
+        for logger in &loggers {
+            logger.write_named(&mut buf);
+        }
+        assert_eq!(String::from_utf8(buf).unwrap(), "[a][b]");
+    }
+}

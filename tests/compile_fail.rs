@@ -86,6 +86,16 @@ fn reflexive_impl_must_be_complete() {
     t.compile_fail("tests/ui/reflexive_unstubbed_multiple.rs");
 }
 
+// `#[dyn_shim(erase)]` lowers a method's generic parameters to trait objects,
+// but only those used behind a reference; a parameter in the return type (no
+// reference to lower, no single concrete type to pick) is rejected directly by
+// the macro, so the snapshot is stable across toolchains.
+#[test]
+fn erase_rejects_inexpressible() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/erase_return_generic.rs");
+}
+
 // `dyn_shim_recognized` only knows `Clone` and `Hash`, and generates the shim's
 // contents itself, so an unrecognized trait and a shim that declares its own
 // items are both rejected by the macro.

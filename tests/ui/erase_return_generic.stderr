@@ -1,0 +1,5 @@
+error: #[dyn_shim(erase)] cannot erase `T`: it appears in the return type
+  --> tests/ui/erase_return_generic.rs:10:35
+   |
+10 |     fn make<T: Default>(&self) -> T;
+   |                                   ^
