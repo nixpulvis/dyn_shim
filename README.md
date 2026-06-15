@@ -34,12 +34,6 @@ trait Parser {
 let parsers: Vec<Box<dyn DynParser>> = Vec::new();
 ```
 
-A method that is non-dyn-compatible only because of a generic argument can be
-kept instead of skipped with `#[dyn_shim(erase)]`, which lowers a parameter
-bounded by one trait and used behind a reference to a trait object (`&mut impl
-Write` becomes `&mut dyn Write`). It is the same erasure the recognized `Hash`
-bound applies to `Hash::hash`'s generic hasher.
-
 ## Make trait objects `Clone` or `Hash`
 
 `Clone` and `Hash` cannot be supertraits of a dyn-compatible trait. List them as
@@ -96,18 +90,11 @@ fn passes(rule: &(impl Rule + ?Sized), n: i32) -> bool {
 // A &dyn DynRule satisfies Rule, so an erased rule can be passed to `passes`.
 ```
 
-A method that cannot forward through the shim has several remediations. Best is
-to make it dispatch: `#[dyn_shim(erase)]` for a generic argument, or
-`#[dyn_shim(boxed)]` for a `-> Self` builder (the shim method returns `Box<dyn
-DynRule>`, the general form of `Clone`'s boxing). Otherwise give it a fallback
-body — `#[dyn_shim(stub = <expr>)]` to degrade to a value, or `#[dyn_shim(panic)]`
-to panic, as `threshold` does above. On a `reflexive = bare` impl a `where Self:
-Sized` method needs nothing: it is left out, so calling it on a `&dyn` is a
-compile error rather than a panic.
-
-The same machinery mounts a non-dyn-compatible trait onto a *different* trait
-object you own: have it inherit the shim, and `#[trait_object(DynRule)]` gives
-`dyn YourTrait` the `Rule` it could never list as a supertrait.
+A method that cannot forward (like the generic `threshold`) picks a remediation —
+forward it anyway by erasing or boxing, supply a fallback body, or stub it; the
+[docs](https://docs.rs/dyn_shim) cover the full ladder. `#[trait_object(DynRule)]`
+mounts that same `Rule` onto a *different* trait object you own, giving `dyn
+YourTrait` a trait it could never list as a supertrait.
 
 ## Shim a trait from another crate
 
@@ -125,18 +112,13 @@ trait DynSink: Clone {
 // Box<dyn DynSink> holds any Clone implementor of other_crate::Sink.
 ```
 
-A restated method given a default body is *provided* by the shim rather than
-forwarded, so you can add a convenience method the foreign trait does not
-declare (its body calls the forwarded methods). In a `#[dyn_shim]` shim a default
-body instead lives on the source trait and is forwarded, honoring an
-implementor's override.
-
 ## Documentation
 
-The [API documentation](https://docs.rs/dyn_shim) covers the full
-method-selection rules, the `reflexive`, recognized-bound, and `#[trait_object]`
-carrier mechanics, and the `dyn_clone`/`dyn_hash` features. A runnable program
-for each lives in [`examples/`](examples/).
+The [API documentation](https://docs.rs/dyn_shim) has the full rules: method
+selection and the per-method helpers (`skip`, `panic`, `stub`, `erase`, `boxed`),
+the `reflexive` option, recognized `Clone`/`Hash` bounds, `#[trait_object]`
+carrier-mounting, foreign shims, and the `dyn_clone`/`dyn_hash` features. A
+runnable example for each lives in [`examples/`](examples/).
 
 ## Testing
 

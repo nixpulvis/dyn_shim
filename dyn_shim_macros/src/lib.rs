@@ -605,6 +605,11 @@ fn expand_hash(shim: &Ident, combos: &[MarkerCombo]) -> (TokenStream2, TokenStre
 /// - It requires `Self: Sized` (such a method is excluded from the vtable).
 /// - It is annotated with `#[dyn_shim(skip)]`.
 ///
+/// Some of these are opt-in remediable rather than skipped: a generic parameter
+/// or `impl Trait` argument can be lowered with
+/// [`#[dyn_shim(erase)]`](#erasing-a-generic-argument), and a `-> Self` builder
+/// can be boxed with [`#[dyn_shim(boxed)]`](#reflexive-impl).
+///
 /// Skipped methods stay on the source trait and are reached on the concrete
 /// type. A forwarded method keeps its entire signature — lifetimes, `where`
 /// clause, parameter names, `unsafe`, and any explicit ABI — as well as its
@@ -687,15 +692,14 @@ fn expand_hash(shim: &Ident, combos: &[MarkerCombo]) -> (TokenStream2, TokenStre
 ///
 /// A method with none of these is a compile error naming it.
 ///
-/// A `-> Self` builder is a special case: rather than stub it, annotate it
-/// `#[dyn_shim(boxed)]`. The shim method then returns `Box<dyn DynFoo>` (the
-/// concrete result, boxed and unsized to the shim object), and the `reflexive =
-/// boxed` impl forwards through it, since there `Self` *is* `Box<dyn DynFoo>`.
-/// So a consuming or chaining builder keeps working on an erased value instead
-/// of panicking. This is the general form of the boxing the recognized `Clone`
-/// bound applies to `clone`; it requires `reflexive = boxed` (a `bare` impl has
-/// an unsized, unconstructible `Self`) and does not yet support auto-trait
-/// markers on the shim.
+/// The `boxed` remediation, in detail: the shim method returns `Box<dyn DynFoo>`
+/// (the concrete result, boxed and unsized to the shim object), and the
+/// `reflexive = boxed` impl forwards through it, since there `Self` *is* `Box<dyn
+/// DynFoo>`. So a consuming or chaining builder keeps working on an erased value
+/// instead of panicking. This is the general form of the boxing the recognized
+/// `Clone` bound applies to `clone`; it requires `reflexive = boxed` (a `bare`
+/// impl has an unsized, unconstructible `Self`) and does not yet support
+/// auto-trait markers on the shim.
 ///
 /// ```
 /// use dyn_shim::dyn_shim;

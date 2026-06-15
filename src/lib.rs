@@ -25,18 +25,18 @@
 //! each behind a feature, as drop-in equivalents of the `dyn_clone` and
 //! `dyn_hash` crates:
 //!
+//! - With the `dyn_clone` feature, [`DynClone`]: `Box<dyn DynClone>` implements
+//!   [`Clone`] and `dyn DynClone` implements [`ToOwned`].
+//! - With the `dyn_hash` feature, [`DynHash`]: `dyn DynHash` implements
+//!   [`Hash`], covering `Box<dyn DynHash>` through the standard library's
+//!   forwarding impl.
+//!
+//! Both cover the `+ Send` and `+ Sync` marker variants.
+//!
 //! To give a trait of your own these capabilities, list `Clone`/`Hash` as
 //! [bounds](macro@dyn_shim#recognized-bounds) on a [`macro@dyn_shim`] shim, or,
 //! when the trait is already dyn-compatible, mount the `DynClone`/`DynHash`
 //! carriers onto its trait objects with [`macro@trait_object`].
-//!
-//! - With the `dyn_clone` feature, [`DynClone`]: `Box<dyn DynClone>` implements
-//! [`Clone`] and `dyn DynClone` implements [`ToOwned`].
-//! - With the `dyn_hash` feature, [`DynHash`]: `dyn DynHash` implements
-//! [`Hash`], covering `Box<dyn DynHash>` through the standard library's
-//! forwarding impl.
-//!
-//! Both cover the `+ Send` and `+ Sync` marker variants.
 
 pub use dyn_shim_macros::{dyn_shim, dyn_shim_foreign};
 
