@@ -1,0 +1,5 @@
+error: #[dyn_shim(boxed)] does not yet support auto-trait markers on a reflexive shim: the boxed return `Box<dyn Shim>` cannot carry `+ Send` and similar
+  --> tests/ui/boxed_with_markers.rs:11:8
+   |
+11 |     fn add(self, n: i32) -> Self;
+   |        ^^^

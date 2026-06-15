@@ -96,6 +96,15 @@ fn erase_rejects_inexpressible() {
     t.compile_fail("tests/ui/erase_return_generic.rs");
 }
 
+// `#[dyn_shim(boxed)]` boxes a `-> Self` builder into `Box<dyn Shim>`. That box
+// is marker-free, so combining the helper with an auto-trait marker on a
+// reflexive shim is rejected by the macro (a stable snapshot).
+#[test]
+fn boxed_rejects_markers() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/boxed_with_markers.rs");
+}
+
 // `dyn_shim_recognized` only knows `Clone` and `Hash`, and generates the shim's
 // contents itself, so an unrecognized trait and a shim that declares its own
 // items are both rejected by the macro.

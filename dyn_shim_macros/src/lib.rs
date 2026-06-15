@@ -647,6 +647,16 @@ fn expand_hash(shim: &Ident, combos: &[MarkerCombo]) -> (TokenStream2, TokenStre
 /// `#[dyn_shim(panic)]` to get a stub that panics if it is ever called through
 /// the shim. A method that is neither is a compile error naming it.
 ///
+/// A `-> Self` builder is a special case: rather than stub it, annotate it
+/// `#[dyn_shim(boxed)]`. The shim method then returns `Box<dyn DynFoo>` (the
+/// concrete result, boxed and unsized to the shim object), and the `reflexive =
+/// boxed` impl forwards through it, since there `Self` *is* `Box<dyn DynFoo>`.
+/// So a consuming or chaining builder keeps working on an erased value instead
+/// of panicking. This is the general form of the boxing the recognized `Clone`
+/// bound applies to `clone`; it requires `reflexive = boxed` (a `bare` impl has
+/// an unsized, unconstructible `Self`) and does not yet support auto-trait
+/// markers on the shim.
+///
 /// ```
 /// use dyn_shim::dyn_shim;
 ///
@@ -670,8 +680,8 @@ fn expand_hash(shim: &Ident, combos: &[MarkerCombo]) -> (TokenStream2, TokenStre
 /// assert_eq!(eat(m), 7);
 /// ```
 ///
-/// The `reflexive` argument and the `#[dyn_shim(panic)]` helper work the same on
-/// [`macro@dyn_shim_foreign`].
+/// The `reflexive` argument and the `#[dyn_shim(panic)]` / `#[dyn_shim(boxed)]`
+/// helpers work the same on [`macro@dyn_shim_foreign`].
 ///
 /// # Bounds
 ///
@@ -1500,6 +1510,26 @@ fn expand(
         MarkerCombo::all(&autos)
     };
 
+    // A `#[dyn_shim(boxed)]` builder's shim method returns the marker-free
+    // `Box<dyn Shim>`, so a reflexive impl on a `+ marker` object form cannot be
+    // satisfied by it. Reject that combination up front rather than emit a type
+    // error on generated code; the boxed builder is still usable without markers.
+    if !reflexive.is_empty()
+        && !autos.is_empty()
+        && let Some(method) = items.iter().find_map(|item| match item {
+            TraitItem::Fn(m) if Helper::of(m) == Some(Helper::Boxed) => Some(m),
+            _ => None,
+        })
+    {
+        return syn::Error::new_spanned(
+            &method.sig.ident,
+            "#[dyn_shim(boxed)] does not yet support auto-trait markers on a reflexive shim: the \
+             boxed return `Box<dyn Shim>` cannot carry `+ Send` and similar",
+        )
+        .to_compile_error()
+        .into();
+    }
+
     // Validate the `#[dyn_shim(...)]` helper attributes: on a method the only
     // supported argument is `skip`; on any other trait item the attribute is
     // rejected outright. Only methods are stripped of it before the trait is
@@ -1539,7 +1569,7 @@ fn expand(
         };
         match skip(method) {
             Some(reason) => skipped.push((method.sig.ident.to_string(), reason)),
-            None => match forward(method, source_ref) {
+            None => match forward(method, &shim_name, source_ref) {
                 Ok((sig, body)) => {
                     sigs.push(sig);
                     impls.push(body);
@@ -2085,12 +2115,19 @@ fn predicate_bounds_any(pred: &syn::WherePredicate, idents: &[&Ident]) -> bool {
 /// for a local source trait, or a path for a foreign one.
 ///
 /// A method marked `#[dyn_shim(erase)]` is routed through [`forward_erased`],
-/// which lowers its generic parameters to trait objects instead of forwarding
-/// the signature verbatim; that path can fail (a generic used by value, in the
-/// return type, ...), so this returns a `Result`.
-fn forward(method: &TraitItemFn, src: &TokenStream2) -> syn::Result<(TokenStream2, TokenStream2)> {
-    if Helper::of(method) == Some(Helper::Erase) {
-        return forward_erased(method, src);
+/// which lowers its generic parameters to trait objects, and one marked
+/// `#[dyn_shim(boxed)]` through [`forward_boxed`], which boxes a `-> Self`
+/// return into `Box<dyn shim>`. Both can fail (a generic used by value, a
+/// non-`Self` return, ...), so this returns a `Result`.
+fn forward(
+    method: &TraitItemFn,
+    shim: &Ident,
+    src: &TokenStream2,
+) -> syn::Result<(TokenStream2, TokenStream2)> {
+    match Helper::of(method) {
+        Some(Helper::Erase) => return forward_erased(method, src),
+        Some(Helper::Boxed) => return forward_boxed(method, shim, src),
+        _ => {}
     }
 
     let mut sig = method.sig.clone();
@@ -2182,6 +2219,100 @@ fn forward_erased(method: &TraitItemFn, src: &TokenStream2) -> syn::Result<(Toke
         #sig {
             #preamble
             <__T as #src>::#name(#self_expr #(, #args)*)
+        }
+    };
+    Ok((shim_sig, shim_impl))
+}
+
+/// Build the shim signature and forwarding body for a `#[dyn_shim(boxed)]`
+/// method: a `-> Self` builder made dyn-compatible by boxing its result into
+/// `Box<dyn shim>`. `Self` would be unsized as the trait object, so it cannot
+/// be returned directly; the shim returns the boxed object instead, and the
+/// blanket impl boxes the concrete result (which unsizes to `Box<dyn shim>`
+/// because the implementor is `shim` and the method requires `Self: 'static`).
+/// A `reflexive = boxed` impl can then satisfy the source `-> Self`, since there
+/// `Self` *is* `Box<dyn shim>`. This is the general form of the boxing the
+/// recognized `Clone` bound applies to `clone`.
+///
+/// Errors (reported where the user opted in) when the shape cannot be boxed: a
+/// return that is not exactly `Self`, a generic method, or `Self` used in an
+/// argument (only the return is boxed).
+fn forward_boxed(
+    method: &TraitItemFn,
+    shim: &Ident,
+    src: &TokenStream2,
+) -> syn::Result<(TokenStream2, TokenStream2)> {
+    let ReturnType::Type(_, ret) = &method.sig.output else {
+        return Err(syn::Error::new_spanned(
+            &method.sig.ident,
+            "#[dyn_shim(boxed)] expects a method returning `Self`, to box into the shim object",
+        ));
+    };
+    if !is_bare_self(ret) {
+        return Err(syn::Error::new_spanned(
+            ret,
+            "#[dyn_shim(boxed)] expects the return type to be exactly `Self`; only a bare `Self` \
+             can be boxed into the shim's trait object",
+        ));
+    }
+    if has_type_or_const_generics(&method.sig) {
+        return Err(syn::Error::new_spanned(
+            &method.sig.ident,
+            "#[dyn_shim(boxed)] cannot apply to a generic method (combine with `erase` is not \
+             yet supported)",
+        ));
+    }
+    for arg in method.sig.inputs.iter().skip(1) {
+        if let FnArg::Typed(pat) = arg
+            && type_finds(&pat.ty, true, false)
+        {
+            return Err(syn::Error::new_spanned(
+                &pat.ty,
+                "#[dyn_shim(boxed)] cannot forward a method that mentions `Self` in an argument; \
+                 only a `-> Self` return is boxed",
+            ));
+        }
+    }
+
+    let mut sig = method.sig.clone();
+    let Some(FnArg::Receiver(recv)) = sig.inputs.first() else {
+        unreachable!("skip guarantees a receiver")
+    };
+    let self_expr = if matches!(ReceiverKind::of(recv), ReceiverKind::Value) {
+        sig.inputs[0] = parse_quote! { self: ::std::boxed::Box<Self> };
+        quote! { *self }
+    } else {
+        quote! { self }
+    };
+
+    // Return the boxed shim object, and require `Self: 'static` so the blanket
+    // impl's `Box<__T>` unsizes to `Box<dyn shim>`. Like `Clone`'s carrier, the
+    // `'static` bound does not exclude the method from the vtable (unlike `Self:
+    // Sized`), and holds at every call site since `Box<dyn shim>` is `'static`.
+    sig.output = parse_quote! { -> ::std::boxed::Box<dyn #shim> };
+    sig.generics
+        .make_where_clause()
+        .predicates
+        .push(parse_quote! { Self: 'static });
+
+    let names = rename_args(&mut sig);
+    let attrs: Vec<&Attribute> = method
+        .attrs
+        .iter()
+        .filter(|a| !a.path().is_ident("dyn_shim"))
+        .collect();
+    let cfg_attrs = cfg_gates(method);
+
+    let name = &method.sig.ident;
+    let shim_sig = quote! {
+        #(#attrs)*
+        #sig ;
+    };
+    let shim_impl = quote! {
+        #(#cfg_attrs)*
+        #[allow(deprecated)]
+        #sig {
+            ::std::boxed::Box::new(<__T as #src>::#name(#self_expr #(, #names)*))
         }
     };
     Ok((shim_sig, shim_impl))
@@ -2554,6 +2685,12 @@ enum Helper {
     /// `&mut dyn Bound` so the method enters the shim's vtable, instead of being
     /// skipped as non-dyn-compatible. See [`erase_generic`].
     Erase,
+    /// `#[dyn_shim(boxed)]`: forward a `-> Self` builder by boxing its result
+    /// into the shim's trait object, so the shim method returns `Box<dyn Shim>`
+    /// and a `reflexive = boxed` impl can satisfy the source `-> Self` (where
+    /// `Self` is the boxed object). See [`forward_boxed`]; this is the general
+    /// case of the boxing the recognized `Clone` bound applies to `clone`.
+    Boxed,
 }
 
 /// If a method cannot be dispatched through a trait object, return a short
@@ -2562,9 +2699,12 @@ fn skip(method: &TraitItemFn) -> Option<&'static str> {
     let sig = &method.sig;
     // `#[dyn_shim(erase)]` keeps a method that is non-dyn-compatible only because
     // of its generic parameters or argument-position `impl Trait`: `erase_generic`
-    // lowers those to trait objects. It cannot rescue a method for any other
-    // reason (`Self`, no receiver, ...), so those still skip.
+    // lowers those to trait objects. `#[dyn_shim(boxed)]` keeps a `-> Self`
+    // builder, boxing the return into the shim object. Neither can rescue a
+    // method for any other reason (no receiver, async, ...), so those still skip;
+    // `forward_erased` / `forward_boxed` then report any opt-in they cannot honor.
     let erasing = Helper::of(method) == Some(Helper::Erase);
+    let boxing = Helper::of(method) == Some(Helper::Boxed);
     if Helper::of(method) == Some(Helper::Skip) {
         Some("opted out with #[dyn_shim(skip)]")
     } else if sig.asyncness.is_some() {
@@ -2575,7 +2715,7 @@ fn skip(method: &TraitItemFn) -> Option<&'static str> {
         Some("generic type or const parameter")
     } else if requires_self_sized(sig) {
         Some("requires Self: Sized")
-    } else if signature_mentions_self(sig) {
+    } else if signature_mentions_self(sig) && !boxing {
         Some("mentions Self")
     } else if signature_mentions_impl_trait(sig) && !erasing {
         Some("uses impl Trait")
@@ -2596,10 +2736,12 @@ impl Helper {
                 Helper::Panic
             } else if meta.path.is_ident("erase") {
                 Helper::Erase
+            } else if meta.path.is_ident("boxed") {
+                Helper::Boxed
             } else {
-                return Err(
-                    meta.error("unsupported dyn_shim argument, expected `skip`, `panic`, or `erase`")
-                );
+                return Err(meta.error(
+                    "unsupported dyn_shim argument, expected `skip`, `panic`, `erase`, or `boxed`",
+                ));
             };
             if helper.replace(which).is_some() {
                 return Err(meta.error("duplicate dyn_shim argument"));
@@ -2609,7 +2751,8 @@ impl Helper {
         helper.ok_or_else(|| {
             syn::Error::new_spanned(
                 attr,
-                "expected #[dyn_shim(skip)], #[dyn_shim(panic)], or #[dyn_shim(erase)]",
+                "expected #[dyn_shim(skip)], #[dyn_shim(panic)], #[dyn_shim(erase)], or \
+                 #[dyn_shim(boxed)]",
             )
         })
     }

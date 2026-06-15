@@ -96,6 +96,12 @@ fn passes(rule: &(impl Rule + ?Sized), n: i32) -> bool {
 // A &dyn DynRule satisfies Rule, so an erased rule can be passed to `passes`.
 ```
 
+A method that cannot forward through the shim is opted into a panicking stub
+with `#[dyn_shim(panic)]`, as `threshold` is above. A `-> Self` builder is the
+exception: `#[dyn_shim(boxed)]` makes the shim method return `Box<dyn DynRule>`,
+so a `reflexive = boxed` impl keeps the builder working on the erased value
+(the general form of `Clone`'s boxing) instead of stubbing it.
+
 The same machinery mounts a non-dyn-compatible trait onto a *different* trait
 object you own: have it inherit the shim, and `#[trait_object(DynRule)]` gives
 `dyn YourTrait` the `Rule` it could never list as a supertrait.

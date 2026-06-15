@@ -1150,3 +1150,62 @@ mod erase_generic_arg {
         assert_eq!(String::from_utf8(buf).unwrap(), "[a][b]");
     }
 }
+
+// `#[dyn_shim(boxed)]` makes a `-> Self` builder dispatchable by boxing the
+// result into the shim object: the shim method returns `Box<dyn DynBuilder>`,
+// and the `reflexive = boxed` impl satisfies the source `-> Self` (where `Self`
+// is the boxed object). This is the general form of `Clone`'s boxing.
+mod boxed_builder {
+    use dyn_shim::dyn_shim;
+
+    #[dyn_shim(DynStep, reflexive = boxed)]
+    trait Step {
+        fn value(&self) -> i32;
+
+        // Consuming builder: `self` by value and `-> Self`, both boxed.
+        #[dyn_shim(boxed)]
+        fn add(self, n: i32) -> Self;
+
+        // Non-consuming builder: `&self -> Self`, also boxed.
+        #[dyn_shim(boxed)]
+        fn doubled(&self) -> Self;
+    }
+
+    #[derive(Clone)]
+    struct Counter(i32);
+    impl Step for Counter {
+        fn value(&self) -> i32 {
+            self.0
+        }
+        fn add(self, n: i32) -> Self {
+            Counter(self.0 + n)
+        }
+        fn doubled(&self) -> Self {
+            Counter(self.0 * 2)
+        }
+    }
+
+    #[test]
+    fn shim_method_returns_boxed_object() {
+        let start: Box<dyn DynStep> = Box::new(Counter(1));
+        // Each builder call dispatches through the vtable and yields a fresh
+        // `Box<dyn DynStep>`. With the reflexive impl in scope a shim object is
+        // both a `DynStep` and a `Step`, so the calls are qualified to the shim
+        // (exactly as in the `reflexive` example).
+        let added = DynStep::add(start, 4);
+        let stepped = DynStep::doubled(&*added);
+        assert_eq!(DynStep::value(&*stepped), 10);
+    }
+
+    // Generic over `Step` by value: a `Box<dyn DynStep>` satisfies it through
+    // the boxed reflexive impl, and the `-> Self` builder returns another box.
+    fn run(s: impl Step) -> i32 {
+        s.add(5).value()
+    }
+
+    #[test]
+    fn boxed_object_satisfies_source_builder() {
+        let erased: Box<dyn DynStep> = Box::new(Counter(2));
+        assert_eq!(run(erased), 7);
+    }
+}
