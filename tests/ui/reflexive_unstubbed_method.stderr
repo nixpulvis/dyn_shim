@@ -1,4 +1,4 @@
-error: `build` is not dyn-compatible (generic type or const parameter), so the reflexive impl cannot forward it; annotate it `#[dyn_shim(panic)]` to provide a panicking stub, or give it a default body
+error: `build` is not dyn-compatible (generic type or const parameter), so the reflexive impl cannot forward it; provide a fallback with `#[dyn_shim(panic)]` or `#[dyn_shim(stub = <expr>)]`, or give it a default body
   --> tests/ui/reflexive_unstubbed_method.rs:11:8
    |
 11 |     fn build<T>(&self, seed: T) -> i32;

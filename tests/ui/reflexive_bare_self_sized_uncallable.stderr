@@ -1,0 +1,15 @@
+error[E0277]: the size for values of type `dyn DynCfg` cannot be known at compilation time
+  --> tests/ui/reflexive_bare_self_sized_uncallable.rs:26:15
+   |
+26 |     let _ = d.rebuild();
+   |               ^^^^^^^ doesn't have a size known at compile-time
+   |
+   = help: the trait `Sized` is not implemented for `dyn DynCfg`
+note: required by a bound in `Cfg::rebuild`
+  --> tests/ui/reflexive_bare_self_sized_uncallable.rs:12:15
+   |
+10 |     fn rebuild(&self) -> i32
+   |        ------- required by a bound in this associated function
+11 |     where
+12 |         Self: Sized;
+   |               ^^^^^ required by this bound in `Cfg::rebuild`

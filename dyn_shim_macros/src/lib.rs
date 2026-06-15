@@ -15,8 +15,8 @@ use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, FnArg, GenericParam, Ident, ItemTrait, Pat, Path, Receiver, ReturnType, Signature,
-    Token, TraitItem, TraitItemFn, Type, TypeParamBound, parse_macro_input, parse_quote,
+    Attribute, Expr, FnArg, GenericParam, Ident, ItemTrait, Pat, Path, Receiver, ReturnType,
+    Signature, Token, TraitItem, TraitItemFn, Type, TypeParamBound, parse_macro_input, parse_quote,
 };
 
 /// Which trait-object form an impl lands on: the bare unsized `dyn X` or the
@@ -668,10 +668,24 @@ fn expand_hash(shim: &Ident, combos: &[MarkerCombo]) -> (TokenStream2, TokenStre
 ///
 /// The impl must account for every method of the source trait. A dyn-compatible
 /// method forwards through the shim. A method that is not dyn-compatible (see
-/// [Method Selection](#method-selection)) cannot forward, so it must either have
-/// a default body on the source trait (which the impl inherits) or be annotated
-/// `#[dyn_shim(panic)]` to get a stub that panics if it is ever called through
-/// the shim. A method that is neither is a compile error naming it.
+/// [Method Selection](#method-selection)) cannot forward; the remediations, from
+/// most to least preferable, are:
+///
+/// - **Make it dispatch** — `#[dyn_shim(erase)]` (generic argument) or
+///   `#[dyn_shim(boxed)]` (`-> Self` builder, see below) turn it into a real
+///   forwarding rather than a stub.
+/// - **Inherit a default body** on the source trait, which the impl reuses.
+/// - **`where Self: Sized`** — on a `reflexive = bare` impl such a method is left
+///   out entirely (it is not part of the unsized object's surface), so calling it
+///   on a `&dyn DynFoo` is a compile error rather than a runtime panic. (The
+///   boxed object is `Sized`, so a `boxed` impl still needs one of the others.)
+/// - **A fallback body** for the erased impl: `#[dyn_shim(stub = <expr>)]`
+///   evaluates `<expr>` (e.g. `None`, `Default::default()`), letting the method
+///   degrade to a value; `#[dyn_shim(panic)]` is the special case that panics
+///   with a generated message. Unlike a default body, a stub leaves the source
+///   trait's method required of concrete implementors.
+///
+/// A method with none of these is a compile error naming it.
 ///
 /// A `-> Self` builder is a special case: rather than stub it, annotate it
 /// `#[dyn_shim(boxed)]`. The shim method then returns `Box<dyn DynFoo>` (the
@@ -1164,11 +1178,12 @@ pub fn dyn_shim(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// provides the body on the shim.)
 ///
 /// The trailing `reflexive = bare | boxed` argument
-/// (`#[dyn_shim_foreign(other_crate::Sink, reflexive = boxed)]`) and the
-/// `#[dyn_shim(panic)]` method helper work here too, emitting `impl
-/// other_crate::Sink for Box<dyn DynSink>` so the boxed shim satisfies the
-/// foreign trait; a provided method is left out of that impl, since it is not a
-/// method of the foreign trait. See [reflexive impl](macro@dyn_shim#reflexive-impl).
+/// (`#[dyn_shim_foreign(other_crate::Sink, reflexive = boxed)]`) and the method
+/// helpers (`#[dyn_shim(panic)]`, `#[dyn_shim(stub = ...)]`, `erase`, `boxed`)
+/// work here too, emitting `impl other_crate::Sink for Box<dyn DynSink>` so the
+/// boxed shim satisfies the foreign trait; a provided method is left out of that
+/// impl, since it is not a method of the foreign trait. See [reflexive
+/// impl](macro@dyn_shim#reflexive-impl).
 ///
 /// [method selection]: macro@dyn_shim#method-selection
 /// [bounds]: macro@dyn_shim#bounds
@@ -1594,7 +1609,7 @@ fn expand(
     if !reflexive.is_empty()
         && !autos.is_empty()
         && let Some(method) = items.iter().find_map(|item| match item {
-            TraitItem::Fn(m) if Helper::of(m) == Some(Helper::Boxed) => Some(m),
+            TraitItem::Fn(m) if matches!(Helper::of(m), Some(Helper::Boxed)) => Some(m),
             _ => None,
         })
     {
@@ -2508,32 +2523,49 @@ fn build_mount_macro(
 }
 
 /// Build one method of the reflexive impl. `Ok(Some(..))` is a method to emit,
-/// `Ok(None)` omits it (a non-forwardable method with a trait default body
-/// inherits that default), and `Err` reports a method that cannot be placed in
-/// the impl at all.
+/// `Ok(None)` omits it, and `Err` reports a method that cannot be placed in the
+/// impl at all. A non-forwardable method is omitted when it has a trait default
+/// body (inherited) or, on the bare form, when it requires `Self: Sized` (not
+/// part of the unsized object's surface); otherwise it needs a stub helper
+/// (`#[dyn_shim(panic)]` / `#[dyn_shim(stub = ...)]`).
 fn reflexive_method(
     kind: ObjectForm,
     shim: &Ident,
     method: &TraitItemFn,
 ) -> syn::Result<Option<TokenStream2>> {
-    let forwardable = skip(method).is_none();
-    let stub = if forwardable {
-        false
-    } else if method.default.is_some() {
-        return Ok(None);
-    } else if Helper::of(method) == Some(Helper::Panic) {
-        true
+    let name = &method.sig.ident;
+
+    let stub_body = if skip(method).is_none() {
+        // Forwardable: dispatched through the shim below.
+        None
     } else {
-        let name = &method.sig.ident;
-        let reason = skip(method).unwrap_or("not dyn-compatible");
-        return Err(syn::Error::new_spanned(
-            name,
-            format!(
-                "`{name}` is not dyn-compatible ({reason}), so the reflexive impl cannot \
-                 forward it; annotate it `#[dyn_shim(panic)]` to provide a panicking stub, \
-                 or give it a default body"
-            ),
-        ));
+        // A `where Self: Sized` method is excluded from the unsized bare
+        // object's surface, so `impl Foo for dyn Shim` need not provide it:
+        // omit it. Calling it on a `&dyn Shim` is then a compile error rather
+        // than a runtime panic. (The boxed object is `Sized`, so it still needs
+        // a stub or default.)
+        if kind == ObjectForm::Bare && requires_self_sized(&method.sig) {
+            return Ok(None);
+        }
+        // A default body on the source trait is inherited by the impl.
+        if method.default.is_some() {
+            return Ok(None);
+        }
+        // Otherwise a stub helper must supply a fallback body.
+        match Helper::of(method).and_then(|h| h.stub_body(shim, name)) {
+            Some(body) => Some(body),
+            None => {
+                let reason = skip(method).unwrap_or("not dyn-compatible");
+                return Err(syn::Error::new_spanned(
+                    name,
+                    format!(
+                        "`{name}` is not dyn-compatible ({reason}), so the reflexive impl cannot \
+                         forward it; provide a fallback with `#[dyn_shim(panic)]` or \
+                         `#[dyn_shim(stub = <expr>)]`, or give it a default body"
+                    ),
+                ));
+            }
+        }
     };
 
     // `reflexive = bare` impls for the unsized `dyn` type, so an emitted method
@@ -2551,24 +2583,20 @@ fn reflexive_method(
     let names = rename_args(&mut sig);
     let cfg_attrs = cfg_gates(method);
 
-    let body = if stub {
-        let msg = format!(
-            "`{}` is not available on the type-erased `{shim}` shim",
-            method.sig.ident
-        );
-        quote! { ::std::panic!(#msg) }
-    } else {
-        let name = &method.sig.ident;
-        let recv = match sig.inputs.first() {
-            Some(FnArg::Receiver(recv)) => recv,
-            _ => unreachable!("a forwarded method has a receiver"),
-        };
-        let recv_expr = kind.reflexive_receiver(recv, name)?;
-        // Dispatch through the shim trait by name, so `Self` infers to the
-        // `dyn` type (vtable dispatch to the concrete implementor). Calling the
-        // source method on `self` instead would resolve right back to this impl
-        // and recurse.
-        quote! { #shim::#name(#recv_expr #(, #names)*) }
+    let body = match stub_body {
+        Some(body) => body,
+        None => {
+            let recv = match sig.inputs.first() {
+                Some(FnArg::Receiver(recv)) => recv,
+                _ => unreachable!("a forwarded method has a receiver"),
+            };
+            let recv_expr = kind.reflexive_receiver(recv, name)?;
+            // Dispatch through the shim trait by name, so `Self` infers to the
+            // `dyn` type (vtable dispatch to the concrete implementor). Calling
+            // the source method on `self` instead would resolve right back to
+            // this impl and recurse.
+            quote! { #shim::#name(#recv_expr #(, #names)*) }
+        }
     };
 
     Ok(Some(quote! {
@@ -2758,16 +2786,11 @@ fn shim_doc(
     lines
 }
 
-/// A `#[dyn_shim(...)]` helper attribute on a method. `skip` and `panic` are
-/// the supported arguments.
-#[derive(Clone, Copy, PartialEq)]
+/// A `#[dyn_shim(...)]` helper attribute on a method.
+#[derive(Clone)]
 enum Helper {
     /// `#[dyn_shim(skip)]`: leave the method off the shim entirely.
     Skip,
-    /// `#[dyn_shim(panic)]`: when a reflexive impl is generated, give this
-    /// method a panicking stub there (for methods that cannot forward through
-    /// the shim).
-    Panic,
     /// `#[dyn_shim(erase)]`: lower the method's generic parameters (each bounded
     /// by a single trait and used only behind a reference) to `&dyn Bound` /
     /// `&mut dyn Bound` so the method enters the shim's vtable, instead of being
@@ -2779,6 +2802,12 @@ enum Helper {
     /// `Self` is the boxed object). See [`forward_boxed`]; this is the general
     /// case of the boxing the recognized `Clone` bound applies to `clone`.
     Boxed,
+    /// A fallback body for a method that cannot forward through the shim, used in
+    /// a reflexive impl. `#[dyn_shim(panic)]` is `Stub(None)` (panic with a
+    /// generated message); `#[dyn_shim(stub = <expr>)]` is `Stub(Some(expr))`,
+    /// letting the method degrade to a value (`None`, `Default::default()`, ...)
+    /// instead of aborting. See [`Helper::stub_body`].
+    Stub(Option<Expr>),
 }
 
 /// A shim method that carries its own body, so it is *provided* by the shim
@@ -2805,9 +2834,10 @@ fn skip(method: &TraitItemFn) -> Option<&'static str> {
     // builder, boxing the return into the shim object. Neither can rescue a
     // method for any other reason (no receiver, async, ...), so those still skip;
     // `forward_erased` / `forward_boxed` then report any opt-in they cannot honor.
-    let erasing = Helper::of(method) == Some(Helper::Erase);
-    let boxing = Helper::of(method) == Some(Helper::Boxed);
-    if Helper::of(method) == Some(Helper::Skip) {
+    let helper = Helper::of(method);
+    let erasing = matches!(helper, Some(Helper::Erase));
+    let boxing = matches!(helper, Some(Helper::Boxed));
+    if matches!(helper, Some(Helper::Skip)) {
         Some("opted out with #[dyn_shim(skip)]")
     } else if sig.asyncness.is_some() {
         Some("async fn")
@@ -2827,22 +2857,42 @@ fn skip(method: &TraitItemFn) -> Option<&'static str> {
 }
 
 impl Helper {
+    /// The fallback body for a non-forwardable method's reflexive stub, if this
+    /// helper supplies one. `#[dyn_shim(panic)]` (`Stub(None)`) panics with a
+    /// generated message naming the method and shim; `#[dyn_shim(stub = <expr>)]`
+    /// (`Stub(Some(expr))`) evaluates `<expr>` instead, letting the method
+    /// degrade to a value (`None`, `Default::default()`, ...) rather than abort.
+    /// Other helpers supply no stub.
+    fn stub_body(&self, shim: &Ident, name: &Ident) -> Option<TokenStream2> {
+        match self {
+            Helper::Stub(None) => {
+                let msg = format!("`{name}` is not available on the type-erased `{shim}` shim");
+                Some(quote! { ::std::panic!(#msg) })
+            }
+            Helper::Stub(Some(expr)) => Some(quote! { #expr }),
+            _ => None,
+        }
+    }
+
     /// Parse a method's `#[dyn_shim(...)]` attribute, which must carry exactly
-    /// one of the supported arguments, `skip` or `panic`.
+    /// one supported argument.
     fn parse(attr: &Attribute) -> syn::Result<Helper> {
         let mut helper = None;
         attr.parse_nested_meta(|meta| {
             let which = if meta.path.is_ident("skip") {
                 Helper::Skip
             } else if meta.path.is_ident("panic") {
-                Helper::Panic
+                Helper::Stub(None)
             } else if meta.path.is_ident("erase") {
                 Helper::Erase
             } else if meta.path.is_ident("boxed") {
                 Helper::Boxed
+            } else if meta.path.is_ident("stub") {
+                Helper::Stub(Some(meta.value()?.parse()?))
             } else {
                 return Err(meta.error(
-                    "unsupported dyn_shim argument, expected `skip`, `panic`, `erase`, or `boxed`",
+                    "unsupported dyn_shim argument, expected `skip`, `panic`, `erase`, `boxed`, \
+                     or `stub = <expr>`",
                 ));
             };
             if helper.replace(which).is_some() {
@@ -2853,8 +2903,8 @@ impl Helper {
         helper.ok_or_else(|| {
             syn::Error::new_spanned(
                 attr,
-                "expected #[dyn_shim(skip)], #[dyn_shim(panic)], #[dyn_shim(erase)], or \
-                 #[dyn_shim(boxed)]",
+                "expected #[dyn_shim(skip)], #[dyn_shim(panic)], #[dyn_shim(erase)], \
+                 #[dyn_shim(boxed)], or #[dyn_shim(stub = <expr>)]",
             )
         })
     }

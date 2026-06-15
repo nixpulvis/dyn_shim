@@ -1290,3 +1290,80 @@ mod foreign_default {
         assert_eq!(use_sink(s), 9);
     }
 }
+
+// #3: in a `reflexive = bare` impl, a `where Self: Sized` method is omitted
+// rather than stubbed — it is not part of the unsized object's surface, so
+// `impl Cfg for dyn DynCfg` need not provide it (and calling it on `&dyn DynCfg`
+// is a compile error, not a runtime panic). Before this, the macro rejected the
+// shim because the method could neither forward nor be stubbed in `bare`.
+#[dyn_shim(DynCfg, reflexive = bare)]
+trait Cfg {
+    fn get(&self) -> i32;
+    // Required (no default), `Self: Sized`-gated: excluded from the bare impl.
+    fn rebuild(&self) -> i32
+    where
+        Self: Sized;
+}
+
+struct Settings(i32);
+impl Cfg for Settings {
+    fn get(&self) -> i32 {
+        self.0
+    }
+    fn rebuild(&self) -> i32 {
+        self.0 + 1
+    }
+}
+
+fn read<C: Cfg + ?Sized>(c: &C) -> i32 {
+    c.get()
+}
+
+#[test]
+fn bare_omits_self_sized_method() {
+    let s = Settings(4);
+    let d: &dyn DynCfg = &s;
+    // `&dyn DynCfg` satisfies `Cfg` by reference; `get` forwards. `rebuild` is
+    // simply not present on the bare impl (a compile error to call here).
+    assert_eq!(read(d), 4);
+    // On the concrete type, `rebuild` still works.
+    assert_eq!(s.rebuild(), 5);
+}
+
+// #5: `#[dyn_shim(stub = <expr>)]` gives a non-forwardable method a custom
+// fallback in the reflexive impl, so it degrades to a value instead of
+// panicking like `#[dyn_shim(panic)]`.
+mod custom_stub {
+    use dyn_shim::dyn_shim;
+
+    #[dyn_shim(DynStore, reflexive = boxed)]
+    trait Store {
+        fn get(&self, key: &str) -> i32;
+        // Generic return: not dyn-compatible. On the erased value, degrade to
+        // `None` rather than aborting.
+        #[dyn_shim(stub = None)]
+        fn parse<T: std::str::FromStr>(&self, key: &str) -> Option<T>;
+    }
+
+    struct Map(i32);
+    impl Store for Map {
+        fn get(&self, _key: &str) -> i32 {
+            self.0
+        }
+        fn parse<T: std::str::FromStr>(&self, _key: &str) -> Option<T> {
+            None
+        }
+    }
+
+    // Through the `impl Store` boundary: the box satisfies `Store`, `get`
+    // forwards, and `parse` hits the `None` stub instead of panicking.
+    fn lookup(s: impl Store) -> (i32, Option<i64>) {
+        (s.get("a"), s.parse::<i64>("a"))
+    }
+
+    #[test]
+    fn stub_expr_degrades_to_value() {
+        let s: Box<dyn DynStore> = Box::new(Map(42));
+        assert_eq!(lookup(s), (42, None));
+    }
+}

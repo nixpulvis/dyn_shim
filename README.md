@@ -96,11 +96,14 @@ fn passes(rule: &(impl Rule + ?Sized), n: i32) -> bool {
 // A &dyn DynRule satisfies Rule, so an erased rule can be passed to `passes`.
 ```
 
-A method that cannot forward through the shim is opted into a panicking stub
-with `#[dyn_shim(panic)]`, as `threshold` is above. A `-> Self` builder is the
-exception: `#[dyn_shim(boxed)]` makes the shim method return `Box<dyn DynRule>`,
-so a `reflexive = boxed` impl keeps the builder working on the erased value
-(the general form of `Clone`'s boxing) instead of stubbing it.
+A method that cannot forward through the shim has several remediations. Best is
+to make it dispatch: `#[dyn_shim(erase)]` for a generic argument, or
+`#[dyn_shim(boxed)]` for a `-> Self` builder (the shim method returns `Box<dyn
+DynRule>`, the general form of `Clone`'s boxing). Otherwise give it a fallback
+body — `#[dyn_shim(stub = <expr>)]` to degrade to a value, or `#[dyn_shim(panic)]`
+to panic, as `threshold` does above. On a `reflexive = bare` impl a `where Self:
+Sized` method needs nothing: it is left out, so calling it on a `&dyn` is a
+compile error rather than a panic.
 
 The same machinery mounts a non-dyn-compatible trait onto a *different* trait
 object you own: have it inherit the shim, and `#[trait_object(DynRule)]` gives

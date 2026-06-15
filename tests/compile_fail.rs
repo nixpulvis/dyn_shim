@@ -84,6 +84,7 @@ fn reflexive_impl_must_be_complete() {
     t.compile_fail("tests/ui/reflexive_both_bare_by_value.rs");
     t.compile_fail("tests/ui/reflexive_unstubbed_method.rs");
     t.compile_fail("tests/ui/reflexive_unstubbed_multiple.rs");
+    t.compile_fail("tests/ui/reflexive_bare_self_sized_uncallable.rs");
 }
 
 // `#[dyn_shim(erase)]` lowers a method's generic parameters to trait objects,
