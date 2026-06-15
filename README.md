@@ -59,6 +59,15 @@ let boxed: Box<dyn DynHash> = Box::new(42u32);
 
 See the [API documentation](https://docs.rs/dyn_shim) for the rest.
 
+## Testing
+
+```sh
+cargo test
+```
+
+The suite includes [`trybuild`](https://crates.io/crates/trybuild) UI tests under
+`tests/ui/` that assert the compile errors for rejected traits and methods.
+
 ## License
 
 Licensed under the MIT license. See [LICENSE](LICENSE) for details.
