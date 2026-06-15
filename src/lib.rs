@@ -13,7 +13,10 @@
 //! By default the shim is a separate trait. A [reflexive
 //! impl](macro@dyn_shim#reflexive-impl) (`reflexive = bare | boxed`) also makes
 //! the shim's trait object satisfy the source trait itself, so it can be passed
-//! to code written against the original.
+//! to code written against the original. [`macro@trait_object`] does the same
+//! for a *different* trait object: it mounts the shim's source trait (or the
+//! shipped `Clone`/`Hash` carriers) onto a dyn-compatible trait you own, so
+//! `dyn YourTrait` satisfies a trait it could not list as a supertrait.
 //!
 //! # Dyn `Clone` and `Hash`
 //!
@@ -24,9 +27,8 @@
 //!
 //! To give a trait of your own these capabilities, list `Clone`/`Hash` as
 //! [bounds](macro@dyn_shim#recognized-bounds) on a [`macro@dyn_shim`] shim, or,
-//! when the trait is already dyn-compatible, add them to its trait objects in
-//! place with [`macro@trait_object`] (gated on the `dyn_clone` and `dyn_hash`
-//! features).
+//! when the trait is already dyn-compatible, mount the `DynClone`/`DynHash`
+//! carriers onto its trait objects with [`macro@trait_object`].
 //!
 //! - With the `dyn_clone` feature, [`DynClone`]: `Box<dyn DynClone>` implements
 //! [`Clone`] and `dyn DynClone` implements [`ToOwned`].

@@ -902,11 +902,11 @@ fn hash_bound_shim_upcasts_to_dyn_hash() {
     assert_eq!(bh.hash_one(erased), bh.hash_one(&Red));
 }
 
-// `#[trait_object(Hash)]` bolts the recognized `Hash` capability onto a trait
-// the user owns that is already dyn-compatible, generating no shim. The trait
-// carries the `DynHash` carrier as an explicit supertrait, and the attribute
-// emits `impl Hash for dyn Tagged`, which also covers `&dyn Tagged` and (through
-// std's forwarding impl) `Box<dyn Tagged>`.
+// `#[trait_object(DynHash)]` mounts the `DynHash` carrier onto a trait the user
+// owns that is already dyn-compatible, generating no shim. The trait inherits
+// `DynHash` as an explicit supertrait, and the attribute emits `impl Hash for dyn
+// Tagged`, which also covers `&dyn Tagged` and (through std's forwarding impl)
+// `Box<dyn Tagged>`.
 #[cfg(feature = "dyn_hash")]
 mod trait_object_hash {
     use dyn_shim::{DynHash, trait_object};
@@ -940,9 +940,9 @@ mod trait_object_hash {
     }
 }
 
-// `#[trait_object(Clone)]` makes `Box<dyn Drawing>` cloneable and `dyn Drawing`
-// `ToOwned`, cloning the underlying concrete value into a fresh box. The carrier
-// is the `DynClone` supertrait.
+// `#[trait_object(DynClone)]` makes `Box<dyn Drawing>` cloneable and `dyn
+// Drawing` `ToOwned`, cloning the underlying concrete value into a fresh box. The
+// carrier is the `DynClone` supertrait.
 #[cfg(feature = "dyn_clone")]
 mod trait_object_clone {
     use dyn_shim::{DynClone, trait_object};

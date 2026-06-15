@@ -1,5 +1,5 @@
-//! Adding `Hash` and `Clone` to the objects of an existing dyn-compatible
-//! trait with `#[trait_object]`.
+//! Mounting the `Clone` and `Hash` carriers onto the objects of an existing
+//! dyn-compatible trait with `#[trait_object]`.
 //!
 //! `Widget` below is already dyn-compatible: it has only `&self` methods, so
 //! `dyn Widget` works on its own. What it lacks is `Hash` and `Clone` on the
@@ -7,11 +7,14 @@
 //! shim, but here `dyn Widget` is the type used directly, so generating a second
 //! trait is not wanted.
 //!
-//! `#[trait_object(DynHash + DynClone)]` adds the impls in place instead. The trait
-//! carries `DynHash` and `DynClone` as supertraits to hold the machinery, and
-//! the attribute makes `dyn Widget` implement `Hash` and `Box<dyn Widget>`
-//! implement `Clone`. Because the carriers are supertraits, every `Widget`
-//! implementor must be `Hash` and `Clone`.
+//! `#[trait_object(DynHash + DynClone)]` mounts those carriers in place instead.
+//! The trait inherits `DynHash` and `DynClone` as supertraits, and the attribute
+//! invokes their mount macros to make `dyn Widget` implement `Hash` and `Box<dyn
+//! Widget>` implement `Clone`. Because the carriers are supertraits, every
+//! `Widget` implementor must be `Hash` and `Clone`.
+//!
+//! See `mount_trait.rs` for naming a `#[dyn_shim]` shim as the carrier, which
+//! gives `dyn Widget` an arbitrary non-dyn-compatible trait the same way.
 //!
 //! Run with: `cargo run --example trait_object --features "dyn_hash dyn_clone"`
 

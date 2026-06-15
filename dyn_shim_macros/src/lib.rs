@@ -1118,27 +1118,41 @@ pub fn dyn_shim_recognized(attr: TokenStream, item: TokenStream) -> TokenStream 
     expand_recognized(&input, bounds)
 }
 
-/// Implement a recognized std trait (`Clone`, `Hash`) for the trait objects of
-/// an dyn-compatible trait you already own, without generating a shim.
+/// Mount a *carrier* onto the trait objects of a dyn-compatible trait you
+/// already own, so `dyn YourTrait` satisfies a trait it cannot carry as a
+/// supertrait — without generating a shim.
 ///
 /// [`macro@dyn_shim`] and [`macro@dyn_shim_foreign`] build a *new*
-/// dyn-compatible trait from one that is not. This attribute is for the case
-/// where the trait is already dyn-compatible and you only want its `dyn`
-/// objects to gain a recognized capability. It generates no trait and no
-/// blanket impl: it re-emits the annotated trait untouched and adds the impls
-/// that make its trait objects `Clone` and/or `Hash`.
+/// dyn-compatible trait from one that is not. This attribute is the other half:
+/// the trait is already dyn-compatible, and you want its `dyn` objects to also
+/// satisfy some target trait. It generates no trait and no blanket impl — it
+/// re-emits the annotated trait untouched and invokes each listed carrier's
+/// mount macro, which stamps the `impl Target for dyn YourTrait` blocks.
 ///
-/// The capability rides on a carrier the trait must already inherit: list
-/// `DynClone` and/or `DynHash` (from this crate, behind the matching feature)
-/// as supertraits, and the attribute fills in the rest. The supertrait is
-/// written explicitly so a reader of the trait sees that every implementor must
-/// be `DynClone` / `DynHash`:
+/// A **carrier** is a trait the annotated trait inherits whose mount macro knows
+/// how to implement a target on a `dyn` type. Two kinds exist, reached the same
+/// way:
+///
+/// - The shipped [`DynClone`] / [`DynHash`] (behind the `dyn_clone` / `dyn_hash`
+///   features). Their target is `Clone` / `Hash`, which cannot be a supertrait
+///   of a dyn-compatible trait. `#[trait_object(DynClone)]` makes `Box<dyn
+///   YourTrait>` cloneable (and `dyn YourTrait` `ToOwned`); `#[trait_object(
+///   DynHash)]` makes `dyn YourTrait` (and so `&dyn` and `Box<dyn>`) hashable.
+/// - Any [`macro@dyn_shim`] shim `DynFoo`. Its target is the source trait `Foo`,
+///   which is not dyn-compatible. `#[trait_object(DynFoo)]` makes `dyn YourTrait`
+///   and `Box<dyn YourTrait>` satisfy `Foo`, forwarding the dyn-compatible
+///   methods through the shim. This is how a non-dyn-compatible `Foo` reaches a
+///   trait object that could never list it as a supertrait: inherit `DynFoo`
+///   instead, then mount `Foo` back on.
+///
+/// The carrier is written as an explicit supertrait, so a reader sees that every
+/// implementor must satisfy it:
 ///
 /// ```
 /// use dyn_shim::{DynHash, trait_object};
 /// use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 ///
-/// #[trait_object(Hash)]
+/// #[trait_object(DynHash)]
 /// trait Event: DynHash {
 ///     fn name(&self) -> &str;
 /// }
@@ -1155,27 +1169,36 @@ pub fn dyn_shim_recognized(attr: TokenStream, item: TokenStream) -> TokenStream 
 /// assert_eq!(bh.hash_one(&*boxed), bh.hash_one(&Tick(7)));
 /// ```
 ///
-/// `Clone` and `Hash` may be combined (`#[trait_object(Hash + Clone)]`), and
-/// auto-trait markers select the covered `dyn` variants exactly as in a
-/// [recognized bound](macro@dyn_shim#recognized-bounds): `#[trait_object(Clone +
-/// Send)]` makes both `Box<dyn Foo>` and `Box<dyn Foo + Send>` cloneable.
-/// `Clone` also implements `ToOwned` for the `dyn` type.
+/// Several carriers may be combined (`#[trait_object(DynHash + DynClone)]`,
+/// `#[trait_object(DynFoo + DynClone)]`), and auto-trait markers select the
+/// covered `dyn` variants exactly as for a [recognized
+/// bound](macro@dyn_shim#recognized-bounds): `#[trait_object(DynClone + Send)]`
+/// makes both `Box<dyn YourTrait>` and `Box<dyn YourTrait + Send>` cloneable.
 ///
-/// # How It Differs From a Recognized Bound
+/// # The carrier is a supertrait, so the contract is strict
 ///
 /// `#[dyn_shim(DynFoo: Hash)]` generates a separate `DynFoo` shim and bounds its
 /// blanket impl by `Hash`, so a non-`Hash` implementor of `Foo` simply never
-/// becomes a `DynFoo`. `#[trait_object(Hash)]` adds no shim and instead requires
-/// the carrier as a supertrait of `Foo` itself, so the contract is stricter:
-/// *every* implementor of `Foo` must be `Hash`. Reach for this attribute when
-/// `Foo` is already dyn-compatible and `dyn Foo` is the type you use directly;
-/// reach for the shim when `Foo` is not dyn-compatible or when only some
-/// implementors are `Hash`.
+/// becomes a `DynFoo`. `#[trait_object(...)]` adds no shim and instead requires
+/// the carrier as a supertrait of the annotated trait itself, so the contract is
+/// stricter: *every* implementor must satisfy the carrier. Reach for this
+/// attribute when the annotated trait is the `dyn` type you use directly; reach
+/// for a recognized bound on a shim when only some implementors qualify.
 ///
-/// Like the recognized bounds, the carrier supertrait is matched by bare name
-/// (`DynClone`, `DynHash`), the same token-match convention as the rest of the
-/// crate: a missing carrier is reported at the attribute, and a user trait that
-/// happens to be named `DynHash` is accepted in its place.
+/// # Relation to [`reflexive`](macro@dyn_shim#reflexive-impl)
+///
+/// Mounting a shim carrier (`#[trait_object(DynFoo)]`) and a `reflexive` impl are
+/// the same operation through the same generated macro: both stamp `impl Foo for
+/// <object>`. `reflexive` mounts onto the shim's *own* objects (`dyn DynFoo`,
+/// `Box<dyn DynFoo>`) at the shim's definition; `#[trait_object(DynFoo)]` mounts
+/// onto a *different* principal that inherits the shim, anywhere `DynFoo` is in
+/// scope (including another crate).
+///
+/// The carrier is matched by the last segment of its path (`DynClone`,
+/// `DynHash`, `DynFoo`), the same token-match convention as the rest of the
+/// crate: a missing carrier supertrait is reported at the attribute. The carrier
+/// must be in scope as a macro at the use site, which its own import provides
+/// (`use krate::DynFoo` brings the trait and its mount macro together).
 #[proc_macro_attribute]
 pub fn trait_object(attr: TokenStream, item: TokenStream) -> TokenStream {
     let BoundList { bounds } = parse_macro_input!(attr as BoundList);

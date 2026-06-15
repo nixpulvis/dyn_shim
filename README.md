@@ -129,26 +129,26 @@ subtrait of `DynClone`/`DynHash`, so `Box<dyn DynFoo>` (or `&dyn DynFoo`)
 upcasts to `Box<dyn DynClone>` (or `&dyn DynHash`) and flows into APIs typed
 against those.
 
-## Capabilities on an existing trait
+## Mounting a trait onto an existing trait object
 
-A reflexive impl and `#[trait_object]` are the same operation: emit `impl Target
-for <trait object>` so an erased value satisfies a trait it cannot carry as a
-supertrait. A reflexive impl targets the source trait on a generated shim's
-object; `#[trait_object]` targets `Clone`/`Hash` on a trait you already own. The
-only structural difference is that `#[dyn_shim]` first builds the dyn-compatible
-shim, a step `#[trait_object]` skips because its input is already
-dyn-compatible.
+A reflexive impl and `#[trait_object]` are the same operation: *mount* a trait
+onto a trait object — emit `impl Target for <object>` so an erased value
+satisfies a trait it cannot carry as a supertrait. The mounting machinery lives
+in a generated macro on a **carrier**; both forms invoke it. A reflexive impl
+mounts the source trait onto its own generated shim's object; `#[trait_object]`
+mounts a carrier onto a trait you already own.
 
-So `#[trait_object]` is for a trait you own that is already dyn-compatible, where
-you want only its trait objects to be `Clone` or `Hash`. It generates no shim.
-The trait lists `DynClone`/`DynHash` as supertraits to carry the machinery, and
-the attribute names the capabilities to implement, so `dyn Foo` itself becomes
-`Clone`/`Hash`:
+`#[trait_object(Carrier)]` re-emits the annotated trait untouched and mounts each
+listed carrier — a trait the annotated trait inherits as a supertrait — onto its
+`dyn` objects. Two kinds of carrier, reached the same way:
+
+The shipped `DynClone`/`DynHash` (whose targets, `Clone`/`Hash`, cannot be
+supertraits of a dyn-compatible trait):
 
 ```rust
 use dyn_shim::{trait_object, DynClone, DynHash};
 
-#[trait_object(Hash + Clone)]
+#[trait_object(DynHash + DynClone)]
 trait Shape: DynHash + DynClone {
     fn area(&self) -> u32;
 }
@@ -156,14 +156,37 @@ trait Shape: DynHash + DynClone {
 // dyn Shape implements Hash, and Box<dyn Shape> implements Clone.
 ```
 
-`Clone` and `Hash` may be listed together, and auto-trait markers
-(`#[trait_object(Clone + Send)]`) select the covered `dyn` variants, like a
-recognized bound. The difference from `#[dyn_shim(DynShape: Hash)]` is the
-contract: the carrier is a supertrait of `Shape`, so every implementor of
-`Shape` must be `Hash`/`Clone`, whereas the shim form only filters which
-implementors become the shim. Reach for `#[trait_object]` when `dyn Foo` is the
-type you use directly. `Hash` requires the `dyn_hash` feature and `Clone` the
-`dyn_clone` feature, since those define the carriers.
+Or any `#[dyn_shim]` shim, which mounts its *source* trait. This is the general
+case: a non-dyn-compatible `Foo` cannot be a supertrait of your dyn-compatible
+`Bar`, so instead inherit the shim `DynFoo` and mount `Foo` back onto `dyn Bar`:
+
+```rust
+use dyn_shim::{dyn_shim, trait_object};
+
+#[dyn_shim(DynFoo)]
+trait Foo {
+    fn weight(&self) -> u32;
+    #[dyn_shim(panic)]
+    fn build<T: From<u32>>(&self) -> T; // generic: not dyn-compatible
+}
+
+#[trait_object(DynFoo)]
+trait Bar: DynFoo {
+    fn name(&self) -> &str;
+}
+
+// &dyn Bar and Box<dyn Bar> satisfy Foo, forwarding through DynFoo.
+fn weigh(f: &impl Foo) -> u32 { f.weight() }
+```
+
+Several carriers may be combined (`#[trait_object(DynFoo + DynClone)]`), and
+auto-trait markers (`#[trait_object(DynClone + Send)]`) select the covered `dyn`
+variants, like a recognized bound. The difference from `#[dyn_shim(DynShape:
+Hash)]` is the contract: the carrier is a supertrait, so *every* implementor must
+satisfy it, whereas the shim form only filters which implementors become the
+shim. Reach for `#[trait_object]` when `dyn Bar` is the type you use directly.
+`DynClone` requires the `dyn_clone` feature and `DynHash` the `dyn_hash` feature,
+since those define those carriers; a shim carrier needs no feature.
 
 See the [API documentation](https://docs.rs/dyn_shim) for details.
 
