@@ -1290,8 +1290,8 @@ fn expand_trait_object(
     }
 
     // Split the list: auto traits are markers, every other bound is a carrier to
-    // mount (named by its mount macro). A bare `Clone`/`Hash` is the old surface,
-    // which named the capability; point it at the carrier trait instead.
+    // mount (named by its mount macro). A bare `Clone`/`Hash` names a capability
+    // rather than a carrier trait, so it is rejected toward the carrier to name.
     let mut carriers: Vec<Path> = Vec::new();
     let mut autos: Vec<AutoTrait> = Vec::new();
     for bound in &bounds {
