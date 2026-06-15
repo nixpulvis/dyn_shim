@@ -449,16 +449,43 @@ fn hash_bridge(principal: &Ident, markers: &TokenStream2, carrier: &TokenStream2
     }
 }
 
+/// Build one *boxing method*: a shim method that returns `Box<dyn shim
+/// markers>` by boxing `call` (an expression of the implementor's own `Self`
+/// type), bounded by `where Self: 'static markers`. `sig` carries the method's
+/// name, receiver, and arguments; its return type and the `'static` bound are
+/// filled in here. The `'static` bound licenses the `Box<__T>` to `Box<dyn
+/// shim>` coercion in the blanket impl without restricting the shim's
+/// implementors (it holds at every call site, since `Box<dyn shim>` is `+
+/// 'static` by default), and unlike `Self: Sized` it does not exclude the method
+/// from the vtable. The marker has to be re-attached here, where the concrete
+/// type is still known: a value boxed as a plain `Box<dyn shim>` could never be
+/// coerced back to `Box<dyn shim + Send>`.
+///
+/// This is the shared core of two boxings: the recognized `Clone` carrier's
+/// `__dyn_shim_clone_box` (boxing `Clone::clone(self)`) and a
+/// `#[dyn_shim(boxed)]` `-> Self` builder (boxing the forwarded source call),
+/// the same way [`erase_generic`] is shared by the `Hash` carrier and
+/// `#[dyn_shim(erase)]`.
+fn build_boxed_method(
+    shim: &Ident,
+    markers: &TokenStream2,
+    mut sig: Signature,
+    call: TokenStream2,
+) -> (Signature, TokenStream2) {
+    sig.output = parse_quote! { -> ::std::boxed::Box<dyn #shim #markers> };
+    sig.generics
+        .make_where_clause()
+        .predicates
+        .push(parse_quote! { Self: 'static #markers });
+    let body = quote! { ::std::boxed::Box::new(#call) };
+    (sig, body)
+}
+
 /// Machinery for a recognized `Clone` bound: per marker combination, a hidden
-/// method cloning into a fresh box, and a `Clone` impl for that box calling
-/// it. The marker has to be re-attached inside the blanket impl, where the
-/// concrete type is still known; a clone erased to a plain `Box<dyn Shim>`
-/// could never be coerced back to `Box<dyn Shim + Send>`. The `where Self:
-/// 'static` bound licenses the `Box<__T>` to `Box<dyn Shim>` coercion in the
-/// blanket impl without restricting the shim itself to `'static`
-/// implementors; it holds at every call site because `Box<dyn Shim>` is `+
-/// 'static` by default. (Unlike `Self: Sized`, it does not exclude the method
-/// from the vtable.)
+/// boxing method cloning into a fresh box, and a `Clone` impl for that box
+/// calling it. The boxing method is built through [`build_boxed_method`], the
+/// same primitive a `#[dyn_shim(boxed)]` builder uses — `Clone` is just the
+/// case whose boxed expression is `Clone::clone(self)`.
 fn expand_clone(
     shim: &Ident,
     combos: &[MarkerCombo],
@@ -468,19 +495,18 @@ fn expand_clone(
     let mut after = TokenStream2::new();
     for MarkerCombo { suffix, markers } in combos {
         let method = format_ident!("__dyn_shim_clone_box{suffix}");
+        let (sig, body) = build_boxed_method(
+            shim,
+            markers,
+            parse_quote! { fn #method(&self) },
+            quote! { ::std::clone::Clone::clone(self) },
+        );
         sigs.extend(quote! {
             #[doc(hidden)]
-            fn #method(&self) -> ::std::boxed::Box<dyn #shim #markers>
-            where
-                Self: 'static #markers;
+            #sig ;
         });
         impls.extend(quote! {
-            fn #method(&self) -> ::std::boxed::Box<dyn #shim #markers>
-            where
-                Self: 'static #markers,
-            {
-                ::std::boxed::Box::new(::std::clone::Clone::clone(self))
-            }
+            #sig { #body }
         });
         // `ToOwned` rides along with `Clone` (handled by `clone_bridge`), one
         // facade for callers who own a box and one for callers holding only
@@ -2285,17 +2311,16 @@ fn forward_boxed(
         quote! { self }
     };
 
-    // Return the boxed shim object, and require `Self: 'static` so the blanket
-    // impl's `Box<__T>` unsizes to `Box<dyn shim>`. Like `Clone`'s carrier, the
-    // `'static` bound does not exclude the method from the vtable (unlike `Self:
-    // Sized`), and holds at every call site since `Box<dyn shim>` is `'static`.
-    sig.output = parse_quote! { -> ::std::boxed::Box<dyn #shim> };
-    sig.generics
-        .make_where_clause()
-        .predicates
-        .push(parse_quote! { Self: 'static });
-
+    let name = method.sig.ident.clone();
     let names = rename_args(&mut sig);
+    // Box the forwarded source call into the shim object. No markers: a boxed
+    // builder's reflexive impl forwards through the shared, combo-independent
+    // mount entries (unlike `Clone`'s dedicated per-combo bridge), so the
+    // marker-free `Box<dyn shim>` is all that path can satisfy — the marker
+    // combination is rejected up front in `expand`.
+    let call = quote! { <__T as #src>::#name(#self_expr #(, #names)*) };
+    let (sig, body) = build_boxed_method(shim, &TokenStream2::new(), sig, call);
+
     let attrs: Vec<&Attribute> = method
         .attrs
         .iter()
@@ -2303,7 +2328,6 @@ fn forward_boxed(
         .collect();
     let cfg_attrs = cfg_gates(method);
 
-    let name = &method.sig.ident;
     let shim_sig = quote! {
         #(#attrs)*
         #sig ;
@@ -2311,9 +2335,7 @@ fn forward_boxed(
     let shim_impl = quote! {
         #(#cfg_attrs)*
         #[allow(deprecated)]
-        #sig {
-            ::std::boxed::Box::new(<__T as #src>::#name(#self_expr #(, #names)*))
-        }
+        #sig { #body }
     };
     Ok((shim_sig, shim_impl))
 }
