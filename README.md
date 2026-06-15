@@ -5,129 +5,59 @@
 [![CI](https://github.com/nixpulvis/dyn_shim/actions/workflows/rust.yml/badge.svg)](https://github.com/nixpulvis/dyn_shim/actions/workflows/rust.yml)
 [![license](https://img.shields.io/crates/l/dyn_shim.svg)](LICENSE)
 
-Make non-dyn-compatible traits usable behind `dyn`, and give trait objects
-capabilities they cannot carry as supertraits — `Clone`, `Hash`, or a trait of
-your own.
+Generate a dyn-compatible shim trait from one that is not, so a mixed set of
+implementors can live behind a single `Box<dyn _>`.
 
 ```toml
 [dependencies]
 dyn_shim = "0.2"
 ```
 
-## Hold a mixed collection behind one `Box<dyn>`
-
-A trait with a by-value `self`, a `-> Self`, or a generic method is not
-dyn-compatible, so `Box<dyn Trait>` is impossible. `#[dyn_shim(Name)]` generates
-a dyn-compatible shim over the dispatchable methods, plus a blanket impl so every
-implementor already is one:
-
 ```rust
 use dyn_shim::dyn_shim;
 
+// Not dyn-compatible: `build` returns `Self`, so `Box<dyn Parser>` is impossible.
 #[dyn_shim(DynParser)]
 trait Parser {
     fn parse(&self, input: &str) -> usize;
-    fn build() -> Self; // skipped: not dispatchable through a trait object
+    fn build() -> Self;
 }
 
-// A heterogeneous set of parsers behind one type.
-let parsers: Vec<Box<dyn DynParser>> = Vec::new();
+struct Words;
+impl Parser for Words {
+    fn parse(&self, input: &str) -> usize { input.split_whitespace().count() }
+    fn build() -> Self { Words }
+}
+
+struct Bytes;
+impl Parser for Bytes {
+    fn parse(&self, input: &str) -> usize { input.len() }
+    fn build() -> Self { Bytes }
+}
+
+// `DynParser` is dyn-compatible, so a heterogeneous set lives behind one type.
+let parsers: Vec<Box<dyn DynParser>> = vec![Box::new(Words), Box::new(Bytes)];
+let total: usize = parsers.iter().map(|p| p.parse("a b c")).sum();
+assert_eq!(total, 3 + 5);
 ```
 
-## Make trait objects `Clone` or `Hash`
+## `dyn-hash` support
 
-`Clone` and `Hash` cannot be supertraits of a dyn-compatible trait. List them as
-recognized bounds on a shim and its trait objects gain them — a drop-in for the
-`dyn-clone` and `dyn-hash` crates:
+With the `dyn_hash` feature, `DynHash` is a drop-in for the
+[`dyn-hash`](https://crates.io/crates/dyn-hash) crate:
+
+```toml
+dyn_shim = { version = "0.2", features = ["dyn_hash"] }
+```
 
 ```rust
-use dyn_shim::dyn_shim;
+use dyn_shim::DynHash;
 
-#[dyn_shim(DynShape: Clone + Hash)]
-trait Shape {
-    fn area(&self) -> f64;
-}
-
-// Box<dyn DynShape> is Clone; dyn DynShape is Hash.
+// `dyn DynHash` (and so `Box<dyn DynHash>`) implements `Hash`.
+let boxed: Box<dyn DynHash> = Box::new(42u32);
 ```
 
-Already own a dyn-compatible trait? `#[trait_object]` mounts the same capabilities
-onto `dyn YourTrait` in place, generating no shim (the `DynClone`/`DynHash`
-carriers are behind the `dyn_clone`/`dyn_hash` features):
-
-```rust
-use dyn_shim::{trait_object, DynClone};
-
-#[trait_object(DynClone)]
-trait Widget: DynClone {
-    fn render(&self) -> String;
-}
-
-// Box<dyn Widget> is Clone.
-```
-
-## Pass an erased value back into trait-generic code
-
-`Rule` below is not dyn-compatible — its generic `threshold` rules out `dyn Rule`
-— so a mixed set lives behind `Box<dyn DynRule>`. But a `Box<dyn DynRule>` is not
-a `Rule`. The `reflexive` option makes it one, so the erased value still flows
-into functions written against the original trait:
-
-```rust
-use dyn_shim::dyn_shim;
-
-#[dyn_shim(DynRule, reflexive = bare + boxed)]
-trait Rule {
-    fn check(&self, n: i32) -> bool;
-    #[dyn_shim(panic)]
-    fn threshold<T: From<i32>>(&self) -> T; // generic: rules out `dyn Rule`
-}
-
-fn passes(rule: &(impl Rule + ?Sized), n: i32) -> bool {
-    rule.check(n)
-}
-
-// A &dyn DynRule satisfies Rule, so an erased rule can be passed to `passes`.
-```
-
-A method that cannot forward (like the generic `threshold`) picks a remediation —
-forward it anyway by erasing or boxing, supply a fallback body, or stub it; the
-[docs](https://docs.rs/dyn_shim) cover the full ladder. `#[trait_object(DynRule)]`
-mounts that same `Rule` onto a *different* trait object you own, giving `dyn
-YourTrait` a trait it could never list as a supertrait.
-
-## Shim a trait from another crate
-
-`#[dyn_shim]` needs the trait's own definition. `#[dyn_shim_foreign(path)]` shims
-one you do not own by restating its dispatchable methods to forward:
-
-```rust
-use dyn_shim::dyn_shim_foreign;
-
-#[dyn_shim_foreign(other_crate::Sink)]
-trait DynSink: Clone {
-    fn write(&mut self, line: &str);
-}
-
-// Box<dyn DynSink> holds any Clone implementor of other_crate::Sink.
-```
-
-## Documentation
-
-The [API documentation](https://docs.rs/dyn_shim) has the full rules: method
-selection and the per-method helpers (`skip`, `panic`, `stub`, `erase`, `boxed`),
-the `reflexive` option, recognized `Clone`/`Hash` bounds, `#[trait_object]`
-carrier-mounting, foreign shims, and the `dyn_clone`/`dyn_hash` features. A
-runnable example for each lives in [`examples/`](examples/).
-
-## Testing
-
-```sh
-cargo test
-```
-
-The suite includes [`trybuild`](https://crates.io/crates/trybuild) UI tests under
-`tests/ui/` that assert the compile errors for rejected traits and methods.
+See the [API documentation](https://docs.rs/dyn_shim) for the rest.
 
 ## License
 
