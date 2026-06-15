@@ -88,13 +88,19 @@ fn reflexive_impl_must_be_complete() {
 }
 
 // `#[dyn_shim(erase)]` lowers a method's generic parameters to trait objects,
-// but only those used behind a reference; a parameter in the return type (no
-// reference to lower, no single concrete type to pick) is rejected directly by
-// the macro, so the snapshot is stable across toolchains.
+// but only those used behind a reference. A parameter in the return type (no
+// reference to lower, no single concrete type to pick) and a by-value parameter
+// (no reference to lower) are both rejected directly by the macro, so those
+// snapshots are stable across toolchains. A parameter that *is* behind a
+// reference but whose bound does not forward through references is accepted by
+// the macro and instead fails to compile on the generated forwarding call; that
+// snapshot is a rustc trait error, so it is toolchain-dependent.
 #[test]
 fn erase_rejects_inexpressible() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/ui/erase_return_generic.rs");
+    t.compile_fail("tests/ui/erase_by_value.rs");
+    t.compile_fail("tests/ui/erase_bound_not_forwarding.rs");
 }
 
 // `#[dyn_shim(boxed)]` boxes a `-> Self` builder into `Box<dyn Shim>`. That box
