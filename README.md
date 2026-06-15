@@ -63,6 +63,31 @@ trait MyTrait: DynClone + DynHash { /* ... */ }
 
 See the [API documentation](https://docs.rs/dyn_shim) for the rest.
 
+## Examples
+
+The [`examples/`](examples) directory has one runnable program per feature:
+
+- [`shim.rs`](examples/shim.rs) - the core: turn a non-dyn-compatible trait into
+  a shim so a mixed set of implementors lives behind one `Box<dyn _>`.
+- [`clone_and_hash.rs`](examples/clone_and_hash.rs) - the recognized `Clone` and
+  `Hash` bounds, making boxed shim objects cloneable and hashable.
+- [`bind.rs`](examples/bind.rs) - `#[dyn_shim_bind]`, binding the
+  `DynClone` / `DynHash` carriers and a `#[dyn_shim]` shim onto a trait that is
+  already dyn-compatible. This is also the migration path from the
+  [`dyn-clone`](https://crates.io/crates/dyn-clone) and
+  [`dyn-hash`](https://crates.io/crates/dyn-hash) crates, replacing their
+  `clone_trait_object!` / `hash_trait_object!` calls. Needs
+  `--features "dyn_clone dyn_hash"`.
+- [`reflexive.rs`](examples/reflexive.rs) - `reflexive` impls that let erased
+  objects flow back into source-trait-generic code, plus the `erase` / `stub` /
+  `panic` / `boxed` remediations for methods that cannot forward.
+- [`foreign.rs`](examples/foreign.rs) - shimming a trait defined in another
+  crate with `#[dyn_shim_foreign]`.
+
+```sh
+cargo run --example shim
+```
+
 ## Testing
 
 ```sh

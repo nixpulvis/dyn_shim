@@ -1,30 +1,33 @@
-//! Letting erased shim objects flow back into `Rule`-generic code, and the
-//! ladder of remediations for the methods that cannot forward through the shim.
+//! Letting erased shim objects flow back into source-trait-generic code with a
+//! `reflexive` impl, plus the ladder of remediations for methods that cannot
+//! forward through the shim.
 //!
-//! `Rule` is not dyn-compatible — its generic methods rule out a vtable — so a
-//! mixed `Vec<Box<dyn DynRule>>` holds the generated `DynRule` shim. On its own
-//! a `dyn DynRule` is not a `Rule`, so `Rule`-generic functions cannot take one.
-//! `reflexive = bare + boxed` bridges that gap from both directions:
+//! By default a shim is a distinct trait, so a `Box<dyn DynRule>` is not a
+//! `Rule` and cannot be passed to `Rule`-generic code. The `reflexive` argument
+//! emits an impl of the source trait for the shim's trait object, bridging that
+//! gap. There are two object forms, requested together as `bare + boxed`:
 //!
 //! - `bare` emits `impl Rule for dyn DynRule`, so a borrow (`&dyn DynRule`)
 //!   satisfies `Rule` by reference.
 //! - `boxed` emits `impl Rule for Box<dyn DynRule>`, so an owned box satisfies
 //!   `Rule` by value.
 //!
-//! Each method that cannot forward through the shim picks a remediation, best to
-//! last resort:
+//! The impl must account for every method. A dyn-compatible method forwards
+//! through the shim; each method that cannot picks a remediation, best to last
+//! resort:
 //!
 //! - `explain` is generic over a `Write` *argument*. `#[dyn_shim(erase)]` lowers
 //!   `&mut W` to `&mut dyn Write`, so it forwards for real, not as a stub.
-//! - `parsed` is generic over its *return*, so it cannot forward — but the return
-//!   can express absence, so `#[dyn_shim(stub = None)]` degrades to `None` on an
+//! - `parsed` is generic over its *return*, so it cannot forward; the return can
+//!   express absence, so `#[dyn_shim(stub = None)]` degrades to `None` on an
 //!   erased value instead of aborting.
 //! - `threshold` is generic over its return with no such fallback, so
 //!   `#[dyn_shim(panic)]` is the last resort. Call it on a concrete rule.
 //!
-//! A `-> Self` builder is the other reflexive remediation, `#[dyn_shim(boxed)]`;
-//! it needs `reflexive = boxed` (a bare `dyn` cannot be a returned `Self`), so it
-//! lives in the `boxed` example.
+//! A consuming `-> Self` builder is the remaining remediation, shown by
+//! `Pipeline` below: `#[dyn_shim(boxed)]` returns `Box<dyn DynPipeline>` instead
+//! of `Self`. It needs `reflexive = boxed` on its own, since a bare `dyn` is
+//! unsized and cannot be a returned `Self`.
 //!
 //! Run with: `cargo run --example reflexive`
 
@@ -93,6 +96,30 @@ impl Rule for Even {
     }
 }
 
+// A consuming builder: `self` by value and `-> Self`. A `-> Self` cannot ride a
+// vtable (the erased `Self` is unsized), so `#[dyn_shim(boxed)]` makes the shim
+// method return `Box<dyn DynPipeline>`, and `reflexive = boxed` satisfies the
+// source `-> Self` (there `Self` *is* `Box<dyn DynPipeline>`). So the builder
+// chains on an erased value rather than panicking.
+#[dyn_shim(DynPipeline, reflexive = boxed)]
+trait Pipeline {
+    fn label(&self) -> String;
+
+    #[dyn_shim(boxed)]
+    fn then(self, step: &str) -> Self;
+}
+
+struct Steps(Vec<String>);
+impl Pipeline for Steps {
+    fn label(&self) -> String {
+        self.0.join(" -> ")
+    }
+    fn then(mut self, step: &str) -> Self {
+        self.0.push(step.to_string());
+        self
+    }
+}
+
 // Generic over `Rule` by reference. A `&dyn DynRule` satisfies the bound through
 // the bare reflexive impl, so it forwards without an allocation.
 fn passes<R: Rule + ?Sized>(rule: &R, value: i32) -> bool {
@@ -105,6 +132,13 @@ fn into_name(rule: impl Rule) -> String {
     rule.name().to_string()
 }
 
+// Generic over `Pipeline` by value. A `Box<dyn DynPipeline>` satisfies the bound
+// through the boxed reflexive impl, and each `then` returns another owned object,
+// so the builder chains without naming the concrete type.
+fn build(pipeline: impl Pipeline) -> String {
+    pipeline.then("validate").then("emit").label()
+}
+
 fn main() {
     let rules: Vec<Box<dyn DynRule>> = vec![Box::new(AtLeast { floor: 10 }), Box::new(Even)];
 
@@ -114,7 +148,7 @@ fn main() {
         // and a `Rule`, so `name` is qualified to the shim.
         let name = DynRule::name(&**rule);
 
-        // `explain` forwards through the shim — its `W: Write` was erased to
+        // `explain` forwards through the shim: its `W: Write` was erased to
         // `&mut dyn Write`, so `&mut Vec<u8>` coerces straight in.
         let mut why = Vec::new();
         DynRule::explain(&**rule, &mut why);
@@ -138,8 +172,12 @@ fn main() {
     }
 
     // `threshold` has only a panicking stub once erased, so call it on a concrete
-    // rule. (`AtLeast { floor: 11 }.threshold()` would also reach the stub via the
-    // reflexive impl if called on a `Box<dyn DynRule>`.)
+    // rule.
     let floor: i64 = AtLeast { floor: 11 }.threshold();
     println!("concrete threshold: {floor}");
+
+    // The boxed `-> Self` builder: an erased pipeline flows into `Pipeline`-generic
+    // code and chains there, each `then` returning another owned shim object.
+    let erased: Box<dyn DynPipeline> = Box::new(Steps(vec!["parse".to_string()]));
+    println!("pipeline: {}", build(erased));
 }

@@ -1,15 +1,23 @@
-//! Broadcasting a message to a mixed set of notification channels.
+//! The core of the crate: turn a trait that is not dyn-compatible into one that
+//! is, so a mixed set of implementors can live behind a single `Box<dyn _>`.
 //!
-//! `Channel` is not dyn-compatible. It has a by-value `close(self)` shutdown
-//! method and a receiverless `connect() -> Self` constructor, so you cannot keep
-//! a mixed list of channel types behind one `Box<dyn Channel>`.
+//! `Channel` is not dyn-compatible. It has a receiverless `connect() -> Self`
+//! constructor and a by-value `close(self)` shutdown, so you cannot hold a mixed
+//! list of channel types behind one `Box<dyn Channel>`.
 //!
 //! `#[dyn_shim(DynChannel)]` reads the trait and generates a dyn-compatible
-//! `DynChannel` shim plus a blanket impl. It forwards `label`, `set_prefix`, and
-//! `deliver` unchanged, rewrites the by-value `close(self)` to
-//! `close(self: Box<Self>)`, and skips the receiverless `connect`.
+//! `DynChannel` shim plus a blanket `impl<T: Channel> DynChannel for T`. Each
+//! method that can ride a vtable is forwarded:
 //!
-//! Run with: `cargo run --example broadcast`
+//! - `label`, `set_prefix`, and `deliver` forward unchanged.
+//! - the by-value `close(self)` is rewritten to `close(self: Box<Self>)`.
+//! - the receiverless `connect` cannot ride a vtable, so it is skipped; call it
+//!   on the concrete type before erasing.
+//!
+//! Every `Channel` implementor is now a `DynChannel`, so `Box<dyn DynChannel>`
+//! holds any of them.
+//!
+//! Run with: `cargo run --example shim`
 
 use dyn_shim::dyn_shim;
 
@@ -81,7 +89,8 @@ impl Channel for Webhook {
 }
 
 fn main() {
-    // Different channel types behind one boxed trait object.
+    // Different channel types behind one boxed trait object. `connect` is called
+    // on the concrete type, since it cannot be reached through the shim.
     let mut channels: Vec<Box<dyn DynChannel>> =
         vec![Box::new(Email::connect()), Box::new(Webhook::connect())];
 
@@ -100,7 +109,7 @@ fn main() {
     println!("\nshutting down:");
     for ch in channels {
         let label = ch.label();
-        let sent = ch.close();
+        let sent = ch.close(); // by-value close, dispatched through Box<Self>
         println!("  {label} sent {sent} message(s)");
     }
 }
