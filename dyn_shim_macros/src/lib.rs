@@ -1146,7 +1146,15 @@ pub fn dyn_shim(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// the shim itself, emitted verbatim, with its body calling the shim's forwarded
 /// methods. Use it to add a convenience method that the foreign trait does not
 /// declare — the macro generates no `<T as Source>::method` call for it, so the
-/// foreign trait needs no counterpart:
+/// foreign trait needs no counterpart. Such a method becomes part of the shim, so
+/// it must be dyn-compatible: a provided method that is not (a generic parameter,
+/// `async`, ...) is an error, since the shim is its only home and it would
+/// otherwise vanish. Make it dyn-compatible, or drop it. This is judged from the
+/// method's signature alone, so the same blind spot applies as elsewhere: a
+/// method made non-dyn-compatible only by a `where Self:` bound other than the
+/// literal `Sized` (see the dyn-compatibility limitations on [`macro@dyn_shim`])
+/// is not caught here. It is emitted as written and fails at the shim's first
+/// `dyn` use instead.
 ///
 /// ```
 /// use dyn_shim::dyn_shim_foreign;
@@ -1662,6 +1670,34 @@ fn expand(
             continue;
         };
         match skip(method) {
+            // In the foreign form a method with a default body is shim-local
+            // (see `is_provided`): the shim itself is its only home, since there
+            // is no source trait to fall back to. If it is not dyn-compatible it
+            // cannot be a method of the shim at all, so its body would vanish
+            // silently. Error instead. (The local form re-emits the source trait
+            // with the default intact, where it is still reached on concrete
+            // types and through a reflexive impl, so a skip there loses nothing.)
+            // A `where Self: Sized` bound or any `#[dyn_shim(...)]` helper already
+            // states the intent, so neither errors here.
+            Some(reason)
+                if !reemit
+                    && method.default.is_some()
+                    && Helper::of(method).is_none()
+                    && !requires_self_sized(&method.sig) =>
+            {
+                let name = &method.sig.ident;
+                return syn::Error::new_spanned(
+                    &method.sig,
+                    format!(
+                        "`{name}` has a default body, so the `{shim_name}` shim provides it \
+                         directly, but it is not dyn-compatible ({reason}) and so cannot be a \
+                         method of the shim. Make it dyn-compatible, give it a `where Self: \
+                         Sized` bound, or remove it."
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            }
             Some(reason) => skipped.push((method.sig.ident.to_string(), reason)),
             // A foreign-shim method with a default body is shim-local: emit it
             // verbatim (minus our helper attrs) so the shim trait carries it,

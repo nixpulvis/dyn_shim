@@ -1,0 +1,5 @@
+error: `scaled` has a default body, so the `DynSink` shim provides it directly, but it is not dyn-compatible (generic type or const parameter) and so cannot be a method of the shim. Make it dyn-compatible, give it a `where Self: Sized` bound, or remove it.
+  --> tests/ui/foreign_default_not_dyn_compatible.rs:15:5
+   |
+15 |     fn scaled<T: From<usize>>(&self) -> T {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
