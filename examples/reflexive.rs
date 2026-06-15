@@ -24,7 +24,7 @@
 //!
 //! A `-> Self` builder is the other reflexive remediation, `#[dyn_shim(boxed)]`;
 //! it needs `reflexive = boxed` (a bare `dyn` cannot be a returned `Self`), so it
-//! lives in the `builder` example.
+//! lives in the `boxed` example.
 //!
 //! Run with: `cargo run --example reflexive`
 

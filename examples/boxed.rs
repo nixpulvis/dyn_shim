@@ -13,7 +13,7 @@
 //! `clone`. It needs `reflexive = boxed`: a bare `dyn` is unsized and cannot be a
 //! returned `Self`.
 //!
-//! Run with: `cargo run --example builder`
+//! Run with: `cargo run --example boxed`
 
 use dyn_shim::dyn_shim;
 
