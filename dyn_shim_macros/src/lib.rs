@@ -223,28 +223,20 @@ impl RecognizedBound {
     /// the fat-pointer splice in `__clone_box` (there is no blanket impl to clone
     /// through here, unlike a recognized bound). `Hash` forwards through the
     /// carrier's `__dyn_shim_hash`, which erases the generic hasher.
+    ///
+    /// The impls are built by the same [`clone_bridge`] / [`hash_bridge`]
+    /// emitters the recognized-bound path uses; only the carrier differs. The
+    /// `$principal` / `$marker` metavariables are handed in as literal tokens for
+    /// the surrounding `macro_rules!` to bind, so the bridges' principal is a
+    /// token stream rather than a known ident.
     fn bind_arm(self, carrier: &Ident) -> TokenStream2 {
+        let principal = quote! { $principal };
+        let markers = quote! { $($marker)* };
         match self {
-            RecognizedBound::Clone => quote! {
-                impl ::std::clone::Clone for ::std::boxed::Box<dyn $principal $($marker)*> {
-                    fn clone(&self) -> Self {
-                        $crate::__clone_box(&**self)
-                    }
-                }
-                impl ::std::borrow::ToOwned for dyn $principal $($marker)* {
-                    type Owned = ::std::boxed::Box<dyn $principal $($marker)*>;
-                    fn to_owned(&self) -> Self::Owned {
-                        $crate::__clone_box(self)
-                    }
-                }
-            },
-            RecognizedBound::Hash => quote! {
-                impl ::std::hash::Hash for dyn $principal $($marker)* {
-                    fn hash<__H: ::std::hash::Hasher>(&self, state: &mut __H) {
-                        <Self as #carrier>::__dyn_shim_hash(self, state)
-                    }
-                }
-            },
+            RecognizedBound::Clone => {
+                clone_bridge(&principal, &markers, |recv| quote! { $crate::__clone_box(#recv) })
+            }
+            RecognizedBound::Hash => hash_bridge(&principal, &markers, &quote! { #carrier }),
         }
     }
 
@@ -406,7 +398,7 @@ impl MarkerCombo {
 /// bound forwards through a generated carrier method, while `dyn_shim_bind` calls
 /// `__clone_box`.
 fn clone_bridge(
-    principal: &Ident,
+    principal: &impl ToTokens,
     markers: &TokenStream2,
     call: impl Fn(TokenStream2) -> TokenStream2,
 ) -> TokenStream2 {
@@ -438,7 +430,11 @@ fn clone_bridge(
 /// for `dyn_shim_bind` (inherited as a supertrait). It is named in a qualified
 /// call so it stays unambiguous when the principal also inherits a same-named
 /// method.
-fn hash_bridge(principal: &Ident, markers: &TokenStream2, carrier: &TokenStream2) -> TokenStream2 {
+fn hash_bridge(
+    principal: &impl ToTokens,
+    markers: &TokenStream2,
+    carrier: &TokenStream2,
+) -> TokenStream2 {
     let bare = ObjectForm::Bare.ty(principal, markers);
     quote! {
         impl ::std::hash::Hash for #bare {
