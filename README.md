@@ -5,167 +5,86 @@
 [![CI](https://github.com/nixpulvis/dyn_shim/actions/workflows/rust.yml/badge.svg)](https://github.com/nixpulvis/dyn_shim/actions/workflows/rust.yml)
 [![license](https://img.shields.io/crates/l/dyn_shim.svg)](LICENSE)
 
-Generate a dyn-compatible shim trait and blanket impl from a source trait that
-is not dyn-compatible.
-
-Some traits are not dyn-compatible, so you cannot hold a mixed set of
-implementors behind one `Box<dyn Trait>`. The `#[dyn_shim(Name)]` attribute
-reads the trait it is applied to, builds a second trait containing only the
-dyn-compatible subset, and forwards each call to the original. Every implementor
-of the source trait then works as a `dyn` shim.
-
-## Usage
-
-Add the dependency:
+Generate a dyn-compatible shim trait from one that is not, so a mixed set of
+implementors can live behind a single `Box<dyn _>`.
 
 ```toml
 [dependencies]
 dyn_shim = "0.2"
 ```
 
-Annotate the trait with `#[dyn_shim(Name)]`, where `Name` is the shim trait to
-generate:
-
 ```rust
 use dyn_shim::dyn_shim;
 
-#[dyn_shim(DynSink)]
-trait Sink {
-    // ...
+// Creates a DynParser trait with the dyn-compatible subset of Parser's methods.
+#[dyn_shim(DynParser)]
+trait Parser {
+    fn parse(&self, input: &str) -> usize;
+    // Not dyn-compatible: returns `Self`, so `Box<dyn Parser>` is impossible.
+    fn build() -> Self;
 }
+
+struct Words;
+impl Parser for Words {
+    fn parse(&self, input: &str) -> usize { input.split_whitespace().count() }
+    fn build() -> Self { Words }
+}
+
+struct Bytes;
+impl Parser for Bytes {
+    fn parse(&self, input: &str) -> usize { input.len() }
+    fn build() -> Self { Bytes }
+}
+
+let parsers: Vec<Box<dyn DynParser>> = vec![
+    Box::new(Words::build()),
+    Box::new(Bytes::build())];
+let total: usize = parsers.iter().map(|p| p.parse("a b c")).sum();
+assert_eq!(total, 3 + 5);
 ```
 
-Bounds after the shim's name become its supertraits. A `Clone` or `Hash` in
-the list is recognized and handled specially: it makes the shim's trait
-objects themselves cloneable (including `ToOwned`) or hashable, covering the
-marker combinations of any auto traits listed alongside:
+## As a `dyn-clone` / `dyn-hash` Replacement
 
-```rust
-use dyn_shim::dyn_shim;
-
-#[dyn_shim(DynShape: Clone + Send)]
-trait Shape {
-    fn area(&self) -> f64;
-    fn scale(&mut self, factor: f64);
-}
-
-// Box<dyn DynShape> and Box<dyn DynShape + Send> implement Clone.
-```
-
-## Reflexive impls
-
-By default the shim is a separate trait, so a `Box<dyn DynFoo>` is not a `Foo`.
-Adding `reflexive = boxed` also generates `impl Foo for Box<dyn DynFoo>`, so the
-boxed trait object satisfies the source trait itself and can be passed to code
-written against `Foo`. Methods that cannot be dispatched through the shim (a
-constructor, a generic method) are opted into a panicking stub with
-`#[dyn_shim(panic)]`:
-
-```rust
-use dyn_shim::dyn_shim;
-
-#[dyn_shim(DynMunch, reflexive = boxed)]
-trait Munch {
-    fn crunch(self) -> u32;
-    #[dyn_shim(panic)]
-    fn fresh() -> Self; // not dispatchable: panics if called on the box
-}
-
-fn eat(m: impl Munch) -> u32 {
-    m.crunch()
-}
-
-// Box<dyn DynMunch> is a Munch, so it can be passed to `eat`.
-```
-
-`reflexive = bare` instead generates `impl Foo for dyn DynFoo`, so a `&dyn
-DynFoo` satisfies `Foo` by reference. It cannot express a by-value `self` or a
-`-> Self`, since `dyn DynFoo` is unsized; use `reflexive = boxed` for those.
-
-## Foreign traits
-
-`#[dyn_shim]` has to sit on the trait's own definition, so it cannot target a
-trait from a dependency. `#[dyn_shim_foreign(path)]` does: the annotated trait
-*is* the shim, restating the foreign methods to forward, and the macro fills in
-the forwarding machinery plus a blanket impl pointing at the foreign path. Its
-name, visibility, and supertrait list work just like `#[dyn_shim]`'s. A proc
-macro cannot see another crate's trait body, so the signatures must be restated
-by hand; a mismatch is caught when the generated forwarding call fails to
-compile.
-
-```rust
-use dyn_shim::dyn_shim_foreign;
-
-#[dyn_shim_foreign(other_crate::Sink)]
-trait DynSink: Clone {
-    fn write(&mut self, line: &str);
-    fn finish(self) -> usize;
-}
-
-// Box<dyn DynSink> holds any Clone implementor of other_crate::Sink.
-```
-
-The `reflexive` option and `#[dyn_shim(panic)]` work on the foreign form too.
-
-## Features
-
-`Clone` and `Hash` cannot be supertraits of a dyn-compatible trait, so this
-crate ships their shims directly, each behind a feature:
+With the `dyn_clone` / `dyn_hash` feature, `DynClone` and `DynHash` are near
+drop-in replacements for the [`dyn-clone`](https://crates.io/crates/dyn-clone)
+and [`dyn-hash`](https://crates.io/crates/dyn-hash) crates. You keep the
+`DynClone` / `DynHash` supertrait and the `clone_trait_object!(MyTrait)` or
+`hash_trait_object!(MyTrait)` macro calls become a `#[dyn_shim_bind(DynClone)]` or
+`#[dyn_shim_bind(DynHash)]` attribute on the trait.
 
 ```toml
-[dependencies]
 dyn_shim = { version = "0.2", features = ["dyn_clone", "dyn_hash"] }
 ```
 
-- `dyn_clone` provides `DynClone`: `Box<dyn DynClone>` implements `Clone` and `dyn
-  DynClone` implements `ToOwned`. It is a drop-in for the `dyn-clone` crate's
-  `DynClone`.
-- `dyn_hash` provides `DynHash`: `dyn DynHash` implements `Hash` (covering `Box<dyn
-  DynHash>` through the standard library's forwarding impl). It mirrors the
-  `dyn-hash` crate.
-
-With a feature on, a recognized `Clone`/`Hash` bound also makes the shim a
-subtrait of `DynClone`/`DynHash`, so `Box<dyn DynFoo>` (or `&dyn DynFoo`)
-upcasts to `Box<dyn DynClone>` (or `&dyn DynHash`) and flows into APIs typed
-against those.
-
-## Capabilities on an existing trait
-
-A reflexive impl and `#[trait_object]` are the same operation: emit `impl Target
-for <trait object>` so an erased value satisfies a trait it cannot carry as a
-supertrait. A reflexive impl targets the source trait on a generated shim's
-object; `#[trait_object]` targets `Clone`/`Hash` on a trait you already own. The
-only structural difference is that `#[dyn_shim]` first builds the dyn-compatible
-shim, a step `#[trait_object]` skips because its input is already
-dyn-compatible.
-
-So `#[trait_object]` is for a trait you own that is already dyn-compatible, where
-you want only its trait objects to be `Clone` or `Hash`. It generates no shim.
-The trait lists `DynClone`/`DynHash` as supertraits to carry the machinery, and
-the attribute names the capabilities to implement, so `dyn Foo` itself becomes
-`Clone`/`Hash`:
-
 ```rust
-use dyn_shim::{trait_object, DynClone, DynHash};
+use dyn_shim::{dyn_shim_bind, DynClone, DynHash};
 
-#[trait_object(Hash + Clone)]
-trait Shape: DynHash + DynClone {
-    fn area(&self) -> u32;
-}
-
-// dyn Shape implements Hash, and Box<dyn Shape> implements Clone.
+#[dyn_shim_bind(DynClone + DynHash)]
+trait MyTrait: DynClone + DynHash { /* ... */ }
 ```
 
-`Clone` and `Hash` may be listed together, and auto-trait markers
-(`#[trait_object(Clone + Send)]`) select the covered `dyn` variants, like a
-recognized bound. The difference from `#[dyn_shim(DynShape: Hash)]` is the
-contract: the carrier is a supertrait of `Shape`, so every implementor of
-`Shape` must be `Hash`/`Clone`, whereas the shim form only filters which
-implementors become the shim. Reach for `#[trait_object]` when `dyn Foo` is the
-type you use directly. `Hash` requires the `dyn_hash` feature and `Clone` the
-`dyn_clone` feature, since those define the carriers.
+See the [API documentation](https://docs.rs/dyn_shim) for the rest.
 
-See the [API documentation](https://docs.rs/dyn_shim) for details.
+## Examples
+
+The [`examples/`](examples) directory has one runnable program per feature:
+
+- [`shim.rs`](examples/shim.rs) - the core: turn a non-dyn-compatible trait into
+  a shim so a mixed set of implementors lives behind one `Box<dyn _>`.
+- [`clone_and_hash.rs`](examples/clone_and_hash.rs) - the recognized `Clone` and
+  `Hash` bounds, making boxed shim objects cloneable and hashable.
+- [`bind.rs`](examples/bind.rs) - `#[dyn_shim_bind]`, binding the
+  `DynClone` / `DynHash` carriers and a `#[dyn_shim]` shim onto a trait that is
+  already dyn-compatible.
+- [`reflexive.rs`](examples/reflexive.rs) - `reflexive` impls that let erased
+  objects flow back into source-trait-generic code, plus the `erase` / `stub` /
+  `panic` / `boxed` remediations for methods that cannot forward.
+- [`foreign.rs`](examples/foreign.rs) - shimming a trait defined in another
+  crate with `#[dyn_shim_foreign]`.
+
+```sh
+cargo run --example shim
+```
 
 ## Testing
 
@@ -173,8 +92,8 @@ See the [API documentation](https://docs.rs/dyn_shim) for details.
 cargo test
 ```
 
-The suite includes [`trybuild`](https://crates.io/crates/trybuild) UI tests
-under `tests/ui/` that assert the compile errors for rejected traits and methods.
+The suite includes [`trybuild`](https://crates.io/crates/trybuild) UI tests under
+`tests/ui/` that assert the compile errors for rejected traits and methods.
 
 ## License
 

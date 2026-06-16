@@ -1,8 +1,11 @@
 // Several methods declare lifetimes that could be elided; they are explicit on
 // purpose, to exercise lifetime forwarding.
 #![allow(clippy::needless_lifetimes)]
+// `fn by_self(self: Self)` is written with the explicit arbitrary-self spelling
+// on purpose, to exercise that the macro rewrites it like by-value `self`.
+#![allow(clippy::needless_arbitrary_self_type)]
 
-use dyn_shim::{dyn_shim, dyn_shim_foreign, dyn_shim_recognized};
+use dyn_shim::{dyn_shim, dyn_shim_bind, dyn_shim_foreign, dyn_shim_recognized};
 use std::fmt::Display;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -902,17 +905,17 @@ fn hash_bound_shim_upcasts_to_dyn_hash() {
     assert_eq!(bh.hash_one(erased), bh.hash_one(&Red));
 }
 
-// `#[trait_object(Hash)]` bolts the recognized `Hash` capability onto a trait
-// the user owns that is already dyn-compatible, generating no shim. The trait
-// carries the `DynHash` carrier as an explicit supertrait, and the attribute
-// emits `impl Hash for dyn Tagged`, which also covers `&dyn Tagged` and (through
-// std's forwarding impl) `Box<dyn Tagged>`.
+// `#[dyn_shim_bind(DynHash)]` binds the `DynHash` carrier onto a trait the user
+// owns that is already dyn-compatible, generating no shim. The trait inherits
+// `DynHash` as an explicit supertrait, and the attribute emits `impl Hash for dyn
+// Tagged`, which also covers `&dyn Tagged` and (through std's forwarding impl)
+// `Box<dyn Tagged>`.
 #[cfg(feature = "dyn_hash")]
-mod trait_object_hash {
-    use dyn_shim::{DynHash, trait_object};
+mod dyn_shim_bind_hash {
+    use dyn_shim::{DynHash, dyn_shim_bind};
     use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 
-    #[trait_object(Hash)]
+    #[dyn_shim_bind(DynHash)]
     trait Tagged: DynHash {
         fn tag(&self) -> u32;
     }
@@ -932,22 +935,22 @@ mod trait_object_hash {
         let by_ref: &dyn Tagged = &Label(5);
         // The trait's own methods still work; the attribute only adds the impl.
         assert_eq!(boxed.tag(), 5);
-        assert_eq!(bh.hash_one(&*boxed), bh.hash_one(&Label(5)));
-        assert_eq!(bh.hash_one(by_ref), bh.hash_one(&Label(5)));
+        assert_eq!(bh.hash_one(&*boxed), bh.hash_one(Label(5)));
+        assert_eq!(bh.hash_one(by_ref), bh.hash_one(Label(5)));
         // Box<dyn Tagged> hashes via std's forwarding impl for Box<T: Hash>.
-        assert_eq!(bh.hash_one(&boxed), bh.hash_one(&Label(5)));
-        assert_ne!(bh.hash_one(by_ref), bh.hash_one(&Label(6)));
+        assert_eq!(bh.hash_one(&boxed), bh.hash_one(Label(5)));
+        assert_ne!(bh.hash_one(by_ref), bh.hash_one(Label(6)));
     }
 }
 
-// `#[trait_object(Clone)]` makes `Box<dyn Drawing>` cloneable and `dyn Drawing`
-// `ToOwned`, cloning the underlying concrete value into a fresh box. The carrier
-// is the `DynClone` supertrait.
+// `#[dyn_shim_bind(DynClone)]` makes `Box<dyn Drawing>` cloneable and `dyn
+// Drawing` `ToOwned`, cloning the underlying concrete value into a fresh box. The
+// carrier is the `DynClone` supertrait.
 #[cfg(feature = "dyn_clone")]
-mod trait_object_clone {
-    use dyn_shim::{DynClone, trait_object};
+mod dyn_shim_bind_clone {
+    use dyn_shim::{DynClone, dyn_shim_bind};
 
-    #[trait_object(Clone)]
+    #[dyn_shim_bind(DynClone)]
     trait Drawing: DynClone {
         fn area(&self) -> u32;
     }
@@ -988,14 +991,74 @@ mod trait_object_clone {
     }
 }
 
+// `#[dyn_shim_bind(DynRecipe)]` binds a `#[dyn_shim]` shim's source trait onto a
+// *different* dyn-compatible trait the user owns. `Recipe` is not dyn-compatible
+// (its `portion` method is generic), so it cannot be a supertrait of `Dish`.
+// Instead `Dish` inherits the generated `DynRecipe` shim, and the attribute
+// invokes the shim's bind macro to emit `impl Recipe for dyn Dish` and
+// `impl Recipe for Box<dyn Dish>`, forwarding the dyn-compatible methods through
+// the shim. So a `&dyn Dish` and an owned `Box<dyn Dish>` each satisfy `Recipe`,
+// even though `dyn Dish` carries it through the `DynRecipe` carrier, not as a
+// supertrait of `Recipe` itself.
+#[dyn_shim(DynRecipe)]
+trait Recipe {
+    fn calories(&self) -> u32;
+    fn scaled(&self, factor: u32) -> u32;
+    #[dyn_shim(panic)]
+    fn portion<U: From<u32>>(&self) -> U; // generic: not dyn-compatible
+}
+
+#[dyn_shim_bind(DynRecipe)]
+trait Dish: DynRecipe {
+    fn name(&self) -> &str;
+}
+
+struct Pasta;
+impl Recipe for Pasta {
+    fn calories(&self) -> u32 {
+        400
+    }
+    fn scaled(&self, factor: u32) -> u32 {
+        400 * factor
+    }
+    fn portion<U: From<u32>>(&self) -> U {
+        U::from(Recipe::calories(self))
+    }
+}
+impl Dish for Pasta {
+    fn name(&self) -> &str {
+        "pasta"
+    }
+}
+
+fn total(r: &(impl Recipe + ?Sized)) -> u32 {
+    r.calories()
+}
+fn consume(r: impl Recipe) -> u32 {
+    r.scaled(2)
+}
+
+#[test]
+fn dyn_shim_bind_binds_shim_source_onto_principal() {
+    let dish: Box<dyn Dish> = Box::new(Pasta);
+    assert_eq!(dish.name(), "pasta"); // Dish's own method still works
+    // `&dyn Dish` satisfies `Recipe` by reference (the bare bind).
+    assert_eq!(total(&*dish), 400);
+    // The generic `portion` lives only on the concrete type (it is a panicking
+    // stub on the erased bind); call it before erasing.
+    assert_eq!(Recipe::portion::<u32>(&Pasta), 400);
+    // `Box<dyn Dish>` satisfies `Recipe` by value (the boxed bind).
+    assert_eq!(consume(dish), 800);
+}
+
 // Hash and Clone combine in one attribute, and listed auto traits select the
 // covered `dyn` marker variants, exactly as for a recognized bound.
 #[cfg(all(feature = "dyn_clone", feature = "dyn_hash"))]
-mod trait_object_combined {
-    use dyn_shim::{DynClone, DynHash, trait_object};
+mod dyn_shim_bind_combined {
+    use dyn_shim::{DynClone, DynHash, dyn_shim_bind};
     use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 
-    #[trait_object(Hash + Clone + Send + Sync)]
+    #[dyn_shim_bind(DynHash + DynClone + Send + Sync)]
     trait Node: DynHash + DynClone {
         fn id(&self) -> u32;
     }
@@ -1013,7 +1076,7 @@ mod trait_object_combined {
         let bh = BuildHasherDefault::<DefaultHasher>::default();
         let boxed: Box<dyn Node> = Box::new(Leaf(3));
         assert_eq!(boxed.clone().id(), 3);
-        assert_eq!(bh.hash_one(&*boxed), bh.hash_one(&Leaf(3)));
+        assert_eq!(bh.hash_one(&*boxed), bh.hash_one(Leaf(3)));
     }
 
     #[test]
@@ -1027,10 +1090,326 @@ mod trait_object_combined {
 
         // `+ Send + Sync`, in any order, hashes through its own impl.
         let both: &(dyn Node + Sync + Send) = &Leaf(4);
-        assert_eq!(bh.hash_one(both), bh.hash_one(&Leaf(4)));
+        assert_eq!(bh.hash_one(both), bh.hash_one(Leaf(4)));
 
         // `+ Sync` is cloneable too.
         let sync: Box<dyn Node + Sync> = Box::new(Leaf(4));
         assert_eq!(sync.clone().id(), 4);
+    }
+}
+
+// `#[dyn_shim(erase)]` lowers a generic argument — bounded by a single trait and
+// used only behind a reference — to `&mut dyn Bound`, so the method enters the
+// shim's vtable instead of being skipped as non-dyn-compatible. A named
+// `<W: Write>` parameter and an argument-position `impl Write` erase the same
+// way; forwarding reborrows the argument so the source method's `W` re-infers to
+// the sized `&mut dyn Write` (sound because std provides `impl Write for &mut W`).
+mod erase_generic_arg {
+    use dyn_shim::dyn_shim;
+    use std::io::Write;
+
+    #[dyn_shim(DynLogger)]
+    trait Logger {
+        fn label(&self) -> &str;
+
+        #[dyn_shim(erase)]
+        fn write_named<W: Write>(&self, out: &mut W);
+
+        #[dyn_shim(erase)]
+        fn write_apit(&self, out: &mut impl Write);
+    }
+
+    struct Tagged(&'static str);
+    impl Logger for Tagged {
+        fn label(&self) -> &str {
+            self.0
+        }
+        fn write_named<W: Write>(&self, out: &mut W) {
+            write!(out, "[{}]", self.0).unwrap();
+        }
+        fn write_apit(&self, out: &mut impl Write) {
+            write!(out, "<{}>", self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn erased_generic_dispatches_through_dyn() {
+        let logger: Box<dyn DynLogger> = Box::new(Tagged("svc"));
+        assert_eq!(logger.label(), "svc");
+
+        let mut buf: Vec<u8> = Vec::new();
+        logger.write_named(&mut buf);
+        logger.write_apit(&mut buf);
+        assert_eq!(String::from_utf8(buf).unwrap(), "[svc]<svc>");
+    }
+
+    #[test]
+    fn heterogeneous_collection_calls_erased_method() {
+        let loggers: Vec<Box<dyn DynLogger>> = vec![Box::new(Tagged("a")), Box::new(Tagged("b"))];
+        let mut buf: Vec<u8> = Vec::new();
+        for logger in &loggers {
+            logger.write_named(&mut buf);
+        }
+        assert_eq!(String::from_utf8(buf).unwrap(), "[a][b]");
+    }
+}
+
+// When an erased parameter is declared `?Sized`, `#[dyn_shim(erase)]` forwards
+// the lowered trait object directly instead of reborrowing it. The source
+// method's parameter then infers to `dyn Sink` (allowed, since it is `?Sized`),
+// which an object-safe bound satisfies on its own. No `impl Sink for &mut dyn
+// Sink` is required, unlike the reborrowed `&mut impl Sink` case.
+mod erase_unsized_bound {
+    use dyn_shim::dyn_shim;
+
+    trait Sink {
+        fn put(&mut self, byte: u8);
+    }
+
+    struct Buf(Vec<u8>);
+    impl Sink for Buf {
+        fn put(&mut self, byte: u8) {
+            self.0.push(byte);
+        }
+    }
+
+    #[dyn_shim(DynWriter)]
+    trait Writer {
+        #[dyn_shim(erase)]
+        fn spill<S: Sink + ?Sized>(&self, out: &mut S);
+    }
+
+    struct Source;
+    impl Writer for Source {
+        fn spill<S: Sink + ?Sized>(&self, out: &mut S) {
+            out.put(1);
+            out.put(2);
+        }
+    }
+
+    #[test]
+    fn unsized_bound_forwards_object_directly() {
+        let w: Box<dyn DynWriter> = Box::new(Source);
+        let mut buf = Buf(Vec::new());
+        // `&mut buf` coerces to the shim's `&mut dyn Sink` argument.
+        w.spill(&mut buf);
+        assert_eq!(buf.0, vec![1, 2]);
+    }
+}
+
+// `#[dyn_shim(boxed)]` makes a `-> Self` builder dispatchable by boxing the
+// result into the shim object: the shim method returns `Box<dyn DynBuilder>`,
+// and the `reflexive = boxed` impl satisfies the source `-> Self` (where `Self`
+// is the boxed object). This is the general form of `Clone`'s boxing.
+mod boxed_builder {
+    use dyn_shim::dyn_shim;
+
+    #[dyn_shim(DynStep, reflexive = boxed)]
+    trait Step {
+        fn value(&self) -> i32;
+
+        // Consuming builder: `self` by value and `-> Self`, both boxed.
+        #[dyn_shim(boxed)]
+        fn add(self, n: i32) -> Self;
+
+        // Non-consuming builder: `&self -> Self`, also boxed.
+        #[dyn_shim(boxed)]
+        fn doubled(&self) -> Self;
+    }
+
+    #[derive(Clone)]
+    struct Counter(i32);
+    impl Step for Counter {
+        fn value(&self) -> i32 {
+            self.0
+        }
+        fn add(self, n: i32) -> Self {
+            Counter(self.0 + n)
+        }
+        fn doubled(&self) -> Self {
+            Counter(self.0 * 2)
+        }
+    }
+
+    #[test]
+    fn shim_method_returns_boxed_object() {
+        let start: Box<dyn DynStep> = Box::new(Counter(1));
+        // Each builder call dispatches through the vtable and yields a fresh
+        // `Box<dyn DynStep>`. With the reflexive impl in scope a shim object is
+        // both a `DynStep` and a `Step`, so the calls are qualified to the shim
+        // (exactly as in the `reflexive` example).
+        let added = DynStep::add(start, 4);
+        let stepped = DynStep::doubled(&*added);
+        assert_eq!(DynStep::value(&*stepped), 10);
+    }
+
+    // Generic over `Step` by value: a `Box<dyn DynStep>` satisfies it through
+    // the boxed reflexive impl, and the `-> Self` builder returns another box.
+    fn run(s: impl Step) -> i32 {
+        s.add(5).value()
+    }
+
+    #[test]
+    fn boxed_object_satisfies_source_builder() {
+        let erased: Box<dyn DynStep> = Box::new(Counter(2));
+        assert_eq!(run(erased), 7);
+    }
+}
+
+// A default body for an UNFORWARDABLE method works through a reflexive impl: the
+// method is not dyn-compatible, so it is skipped from the shim and omitted from
+// the reflexive impl, which inherits the source trait's default. The default
+// runs on the erased value, calling the forwarded methods through the shim.
+#[dyn_shim(DynMeter, reflexive = boxed)]
+trait Meter {
+    fn reading(&self) -> i32;
+    // Generic, so not dyn-compatible: skipped from `DynMeter`. Its default body
+    // is inherited by `impl Meter for Box<dyn DynMeter>` rather than stubbed.
+    fn scaled<T: From<i32>>(&self) -> T {
+        T::from(self.reading())
+    }
+}
+
+struct Sensor(i32);
+impl Meter for Sensor {
+    fn reading(&self) -> i32 {
+        self.0
+    }
+}
+
+#[test]
+fn reflexive_inherits_default_for_unforwardable() {
+    let m: Box<dyn DynMeter> = Box::new(Sensor(6));
+    // `scaled` is not on `DynMeter`, but `Box<dyn DynMeter>: Meter` inherits the
+    // default, which dispatches `reading` back through the shim.
+    let doubled: i64 = m.scaled();
+    assert_eq!(doubled, 6);
+}
+
+// A `#[dyn_shim_foreign]` shim may add a method with a default body that the
+// foreign trait does not declare: it is provided by the shim (computed from the
+// forwarded methods) instead of forwarded, so it needs no counterpart on the
+// foreign trait. `reflexive = boxed` still works — the provided method is left
+// out of `impl Foreign for Box<dyn Shim>`, which only restates foreign methods.
+mod foreign_default {
+    use dyn_shim::dyn_shim_foreign;
+
+    mod upstream {
+        pub trait Sink {
+            fn total(&self) -> usize;
+        }
+    }
+
+    #[dyn_shim_foreign(upstream::Sink, reflexive = boxed)]
+    trait DynSink {
+        fn total(&self) -> usize;
+        // Shim-local: not a method of `upstream::Sink`. Its default forwards
+        // through the shim's `total`.
+        fn doubled(&self) -> usize {
+            self.total() * 2
+        }
+    }
+
+    struct Buf(usize);
+    impl upstream::Sink for Buf {
+        fn total(&self) -> usize {
+            self.0
+        }
+    }
+
+    #[test]
+    fn provided_default_on_shim() {
+        let s: Box<dyn DynSink> = Box::new(Buf(4));
+        assert_eq!(s.total(), 4);
+        assert_eq!(s.doubled(), 8); // provided default, callable on the erased value
+    }
+
+    fn use_sink(s: impl upstream::Sink) -> usize {
+        s.total()
+    }
+
+    #[test]
+    fn boxed_still_satisfies_foreign_trait() {
+        // The reflexive impl omits the provided `doubled`, so `Box<dyn DynSink>`
+        // satisfies `upstream::Sink` (which has only `total`).
+        let s: Box<dyn DynSink> = Box::new(Buf(9));
+        assert_eq!(use_sink(s), 9);
+    }
+}
+
+// #3: in a `reflexive = bare` impl, a `where Self: Sized` method is omitted
+// rather than stubbed — it is not part of the unsized object's surface, so
+// `impl Cfg for dyn DynCfg` need not provide it (and calling it on `&dyn DynCfg`
+// is a compile error, not a runtime panic). Before this, the macro rejected the
+// shim because the method could neither forward nor be stubbed in `bare`.
+#[dyn_shim(DynCfg, reflexive = bare)]
+trait Cfg {
+    fn get(&self) -> i32;
+    // Required (no default), `Self: Sized`-gated: excluded from the bare impl.
+    fn rebuild(&self) -> i32
+    where
+        Self: Sized;
+}
+
+struct Settings(i32);
+impl Cfg for Settings {
+    fn get(&self) -> i32 {
+        self.0
+    }
+    fn rebuild(&self) -> i32 {
+        self.0 + 1
+    }
+}
+
+fn read<C: Cfg + ?Sized>(c: &C) -> i32 {
+    c.get()
+}
+
+#[test]
+fn bare_omits_self_sized_method() {
+    let s = Settings(4);
+    let d: &dyn DynCfg = &s;
+    // `&dyn DynCfg` satisfies `Cfg` by reference; `get` forwards. `rebuild` is
+    // simply not present on the bare impl (a compile error to call here).
+    assert_eq!(read(d), 4);
+    // On the concrete type, `rebuild` still works.
+    assert_eq!(s.rebuild(), 5);
+}
+
+// #5: `#[dyn_shim(stub = <expr>)]` gives a non-forwardable method a custom
+// fallback in the reflexive impl, so it degrades to a value instead of
+// panicking like `#[dyn_shim(panic)]`.
+mod custom_stub {
+    use dyn_shim::dyn_shim;
+
+    #[dyn_shim(DynStore, reflexive = boxed)]
+    trait Store {
+        fn get(&self, key: &str) -> i32;
+        // Generic return: not dyn-compatible. On the erased value, degrade to
+        // `None` rather than aborting.
+        #[dyn_shim(stub = None)]
+        fn parse<T: std::str::FromStr>(&self, key: &str) -> Option<T>;
+    }
+
+    struct Map(i32);
+    impl Store for Map {
+        fn get(&self, _key: &str) -> i32 {
+            self.0
+        }
+        fn parse<T: std::str::FromStr>(&self, _key: &str) -> Option<T> {
+            None
+        }
+    }
+
+    // Through the `impl Store` boundary: the box satisfies `Store`, `get`
+    // forwards, and `parse` hits the `None` stub instead of panicking.
+    fn lookup(s: impl Store) -> (i32, Option<i64>) {
+        (s.get("a"), s.parse::<i64>("a"))
+    }
+
+    #[test]
+    fn stub_expr_degrades_to_value() {
+        let s: Box<dyn DynStore> = Box::new(Map(42));
+        assert_eq!(lookup(s), (42, None));
     }
 }

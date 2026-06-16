@@ -1,0 +1,17 @@
+error[E0277]: the trait bound `&mut dyn Sink: Sink` is not satisfied
+  --> tests/ui/erase_bound_not_forwarding.rs:14:1
+   |
+14 | #[dyn_shim(Dyn)]
+   | ^^^^^^^^^^^^^^^^ the trait `Sink` is not implemented for `&mut dyn Sink`
+   |
+help: this trait has no implementations, consider adding one
+  --> tests/ui/erase_bound_not_forwarding.rs:10:1
+   |
+10 | trait Sink {
+   | ^^^^^^^^^^
+note: required by a bound in `Src::drain`
+  --> tests/ui/erase_bound_not_forwarding.rs:17:36
+   |
+17 |     fn drain(&self, out: &mut impl Sink);
+   |                                    ^^^^ required by this bound in `Src::drain`
+   = note: this error originates in the attribute macro `dyn_shim` (in Nightly builds, run with -Z macro-backtrace for more info)

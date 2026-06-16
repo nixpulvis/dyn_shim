@@ -16,8 +16,8 @@ jobs:
 
     strategy:
       matrix:
-        # `DynClone`, `DynHash`, and `trait_object` are feature-gated, so cover
-        # no features, each on its own, and both together.
+        # `DynClone` and `DynHash` are feature-gated, so cover no features, each
+        # on its own, and both together.
         features:
           - ""
           - "dyn_clone"
@@ -32,6 +32,8 @@ jobs:
       run: cargo build --verbose --features "${{ matrix.features }}"
     - name: Run tests
       run: cargo test --verbose --features "${{ matrix.features }}"
+    - name: Run doc tests
+      run: cargo test --workspace --doc --verbose --features "${{ matrix.features }}"
 
   miri:
 

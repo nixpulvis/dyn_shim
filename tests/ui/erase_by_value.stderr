@@ -1,0 +1,5 @@
+error: #[dyn_shim(erase)] cannot erase `T`: it is not used behind a `&` or `&mut` argument (only such uses lower to a trait object)
+  --> tests/ui/erase_by_value.rs:10:13
+   |
+10 |     fn sink<T: std::fmt::Debug>(&self, value: T);
+   |             ^

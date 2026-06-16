@@ -32,6 +32,7 @@ fn invalid_helper_attrs_rejected() {
     t.compile_fail("tests/ui/attr_non_method.rs");
     t.compile_fail("tests/ui/attr_unknown_arg.rs");
     t.compile_fail("tests/ui/foreign_missing_path.rs");
+    t.compile_fail("tests/ui/foreign_default_not_dyn_compatible.rs");
 }
 
 // A recognized bound (`Clone`, `Hash`) constrains the blanket impl, so an
@@ -84,6 +85,32 @@ fn reflexive_impl_must_be_complete() {
     t.compile_fail("tests/ui/reflexive_both_bare_by_value.rs");
     t.compile_fail("tests/ui/reflexive_unstubbed_method.rs");
     t.compile_fail("tests/ui/reflexive_unstubbed_multiple.rs");
+    t.compile_fail("tests/ui/reflexive_bare_self_sized_uncallable.rs");
+}
+
+// `#[dyn_shim(erase)]` lowers a method's generic parameters to trait objects,
+// but only those used behind a reference. A parameter in the return type (no
+// reference to lower, no single concrete type to pick) and a by-value parameter
+// (no reference to lower) are both rejected directly by the macro, so those
+// snapshots are stable across toolchains. A parameter that *is* behind a
+// reference but whose bound does not forward through references is accepted by
+// the macro and instead fails to compile on the generated forwarding call; that
+// snapshot is a rustc trait error, so it is toolchain-dependent.
+#[test]
+fn erase_rejects_inexpressible() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/erase_return_generic.rs");
+    t.compile_fail("tests/ui/erase_by_value.rs");
+    t.compile_fail("tests/ui/erase_bound_not_forwarding.rs");
+}
+
+// `#[dyn_shim(boxed)]` boxes a `-> Self` builder into `Box<dyn Shim>`. That box
+// is marker-free, so combining the helper with an auto-trait marker on a
+// reflexive shim is rejected by the macro (a stable snapshot).
+#[test]
+fn boxed_rejects_markers() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/boxed_with_markers.rs");
 }
 
 // `dyn_shim_recognized` only knows `Clone` and `Hash`, and generates the shim's
@@ -96,16 +123,15 @@ fn recognized_misuse_rejected() {
     t.compile_fail("tests/ui/recognized_has_items.rs");
 }
 
-// `trait_object` adds a recognized capability to a trait that already inherits
-// its carrier. It rejects a missing carrier supertrait, an argument list with no
-// recognized trait, and a pass-through trait it has no machinery for. All three
-// errors come from the macro itself, so the snapshots are stable across
-// toolchains. The attribute is feature-gated, so these run only when it exists.
-#[cfg(any(feature = "dyn_clone", feature = "dyn_hash"))]
+// `dyn_shim_bind` binds a carrier onto a trait that already inherits it. It
+// rejects a missing carrier supertrait, an argument list naming no carrier, and
+// the old spelling that named a capability (`Clone`/`Hash`) instead of a
+// carrier trait. All three errors come from the macro itself, so the snapshots
+// are stable across toolchains.
 #[test]
-fn trait_object_misuse_rejected() {
+fn dyn_shim_bind_misuse_rejected() {
     let t = trybuild::TestCases::new();
-    t.compile_fail("tests/ui/trait_object_missing_carrier.rs");
-    t.compile_fail("tests/ui/trait_object_no_recognized.rs");
-    t.compile_fail("tests/ui/trait_object_passthrough.rs");
+    t.compile_fail("tests/ui/dyn_shim_bind_missing_carrier.rs");
+    t.compile_fail("tests/ui/dyn_shim_bind_no_recognized.rs");
+    t.compile_fail("tests/ui/dyn_shim_bind_capability_name.rs");
 }

@@ -15,8 +15,8 @@ use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, FnArg, GenericParam, Ident, ItemTrait, Pat, Path, Receiver, ReturnType, Signature,
-    Token, TraitItem, TraitItemFn, Type, TypeParamBound, parse_macro_input,
+    Attribute, Expr, FnArg, GenericParam, Ident, ItemTrait, Pat, Path, Receiver, ReturnType,
+    Signature, Token, TraitItem, TraitItemFn, Type, TypeParamBound, parse_macro_input, parse_quote,
 };
 
 /// Which trait-object form an impl lands on: the bare unsized `dyn X` or the
@@ -128,7 +128,7 @@ impl Parse for ForeignArgs {
 
 /// A bare `+`-joined bound list, the whole attribute argument for both
 /// [`macro@dyn_shim_recognized`] (a recognized trait to expose as a shim, plus
-/// auto-trait markers) and [`macro@trait_object`] (recognized traits to
+/// auto-trait markers) and [`macro@dyn_shim_bind`] (recognized traits to
 /// implement for a trait's `dyn` objects, plus markers). Each validates the
 /// contents itself; this only parses the syntax (`Clone + Send`).
 struct BoundList {
@@ -209,6 +209,36 @@ impl RecognizedBound {
                 Some(quote! { ::dyn_shim::DynHash })
             }
             _ => None,
+        }
+    }
+
+    /// The body of the `@bind` arm of this carrier's bind macro: the bridge
+    /// impls that put the capability on `dyn $principal $($marker)*`, forwarding
+    /// through the carrier the way `#[dyn_shim_bind]` does. `$principal` and
+    /// `$marker` are emitted as literal metavariables for the surrounding
+    /// `macro_rules!` to bind; `carrier` is the carrier trait whose inherited
+    /// method does the erased work (the shim this macro is generated for).
+    ///
+    /// `Clone` reconstructs `Box<dyn $principal>` from the concrete value with
+    /// the fat-pointer splice in `__clone_box` (there is no blanket impl to clone
+    /// through here, unlike a recognized bound). `Hash` forwards through the
+    /// carrier's `__dyn_shim_hash`, which erases the generic hasher.
+    ///
+    /// The impls are built by the same [`clone_bridge`] / [`hash_bridge`]
+    /// emitters the recognized-bound path uses; only the carrier differs. The
+    /// `$principal` / `$marker` metavariables are handed in as literal tokens for
+    /// the surrounding `macro_rules!` to bind, so the bridges' principal is a
+    /// token stream rather than a known ident.
+    fn bind_arm(self, carrier: &Ident) -> TokenStream2 {
+        let principal = quote! { $principal };
+        let markers = quote! { $($marker)* };
+        match self {
+            RecognizedBound::Clone => clone_bridge(
+                &principal,
+                &markers,
+                |recv| quote! { $crate::__clone_box(#recv) },
+            ),
+            RecognizedBound::Hash => hash_bridge(&principal, &markers, &quote! { #carrier }),
         }
     }
 
@@ -367,10 +397,10 @@ impl MarkerCombo {
 /// value into a fresh `Box<dyn principal markers>`. `call` builds the cloning
 /// expression from the receiver it is handed (`&**self` for `Clone`, `self` for
 /// `ToOwned`). The two paths that emit these differ only in `call`: a recognized
-/// bound forwards through a generated carrier method, while `trait_object` calls
+/// bound forwards through a generated carrier method, while `dyn_shim_bind` calls
 /// `__clone_box`.
 fn clone_bridge(
-    principal: &Ident,
+    principal: &impl ToTokens,
     markers: &TokenStream2,
     call: impl Fn(TokenStream2) -> TokenStream2,
 ) -> TokenStream2 {
@@ -399,10 +429,14 @@ fn clone_bridge(
 /// `impl<T: ?Sized + Hash> Hash for Box<T>`, `Box<dyn principal>`. `carrier`
 /// names the trait whose `__dyn_shim_hash` does the erased hashing: the shim
 /// itself for a recognized bound (where that method is generated), or `DynHash`
-/// for `trait_object` (inherited as a supertrait). It is named in a qualified
+/// for `dyn_shim_bind` (inherited as a supertrait). It is named in a qualified
 /// call so it stays unambiguous when the principal also inherits a same-named
 /// method.
-fn hash_bridge(principal: &Ident, markers: &TokenStream2, carrier: &TokenStream2) -> TokenStream2 {
+fn hash_bridge(
+    principal: &impl ToTokens,
+    markers: &TokenStream2,
+    carrier: &TokenStream2,
+) -> TokenStream2 {
     let bare = ObjectForm::Bare.ty(principal, markers);
     quote! {
         impl ::std::hash::Hash for #bare {
@@ -413,16 +447,43 @@ fn hash_bridge(principal: &Ident, markers: &TokenStream2, carrier: &TokenStream2
     }
 }
 
+/// Build one *boxing method*: a shim method that returns `Box<dyn shim
+/// markers>` by boxing `call` (an expression of the implementor's own `Self`
+/// type), bounded by `where Self: 'static markers`. `sig` carries the method's
+/// name, receiver, and arguments; its return type and the `'static` bound are
+/// filled in here. The `'static` bound licenses the `Box<__T>` to `Box<dyn
+/// shim>` coercion in the blanket impl without restricting the shim's
+/// implementors (it holds at every call site, since `Box<dyn shim>` is `+
+/// 'static` by default), and unlike `Self: Sized` it does not exclude the method
+/// from the vtable. The marker has to be re-attached here, where the concrete
+/// type is still known: a value boxed as a plain `Box<dyn shim>` could never be
+/// coerced back to `Box<dyn shim + Send>`.
+///
+/// This is the shared core of two boxings: the recognized `Clone` carrier's
+/// `__dyn_shim_clone_box` (boxing `Clone::clone(self)`) and a
+/// `#[dyn_shim(boxed)]` `-> Self` builder (boxing the forwarded source call),
+/// the same way [`erase_generic`] is shared by the `Hash` carrier and
+/// `#[dyn_shim(erase)]`.
+fn build_boxed_method(
+    shim: &Ident,
+    markers: &TokenStream2,
+    mut sig: Signature,
+    call: TokenStream2,
+) -> (Signature, TokenStream2) {
+    sig.output = parse_quote! { -> ::std::boxed::Box<dyn #shim #markers> };
+    sig.generics
+        .make_where_clause()
+        .predicates
+        .push(parse_quote! { Self: 'static #markers });
+    let body = quote! { ::std::boxed::Box::new(#call) };
+    (sig, body)
+}
+
 /// Machinery for a recognized `Clone` bound: per marker combination, a hidden
-/// method cloning into a fresh box, and a `Clone` impl for that box calling
-/// it. The marker has to be re-attached inside the blanket impl, where the
-/// concrete type is still known; a clone erased to a plain `Box<dyn Shim>`
-/// could never be coerced back to `Box<dyn Shim + Send>`. The `where Self:
-/// 'static` bound licenses the `Box<__T>` to `Box<dyn Shim>` coercion in the
-/// blanket impl without restricting the shim itself to `'static`
-/// implementors; it holds at every call site because `Box<dyn Shim>` is `+
-/// 'static` by default. (Unlike `Self: Sized`, it does not exclude the method
-/// from the vtable.)
+/// boxing method cloning into a fresh box, and a `Clone` impl for that box
+/// calling it. The boxing method is built through [`build_boxed_method`], the
+/// same primitive a `#[dyn_shim(boxed)]` builder uses — `Clone` is just the
+/// case whose boxed expression is `Clone::clone(self)`.
 fn expand_clone(
     shim: &Ident,
     combos: &[MarkerCombo],
@@ -432,19 +493,18 @@ fn expand_clone(
     let mut after = TokenStream2::new();
     for MarkerCombo { suffix, markers } in combos {
         let method = format_ident!("__dyn_shim_clone_box{suffix}");
+        let (sig, body) = build_boxed_method(
+            shim,
+            markers,
+            parse_quote! { fn #method(&self) },
+            quote! { ::std::clone::Clone::clone(self) },
+        );
         sigs.extend(quote! {
             #[doc(hidden)]
-            fn #method(&self) -> ::std::boxed::Box<dyn #shim #markers>
-            where
-                Self: 'static #markers;
+            #sig ;
         });
         impls.extend(quote! {
-            fn #method(&self) -> ::std::boxed::Box<dyn #shim #markers>
-            where
-                Self: 'static #markers,
-            {
-                ::std::boxed::Box::new(::std::clone::Clone::clone(self))
-            }
+            #sig { #body }
         });
         // `ToOwned` rides along with `Clone` (handled by `clone_bridge`), one
         // facade for callers who own a box and one for callers holding only
@@ -468,14 +528,31 @@ fn expand_clone(
 /// types directly means std's `impl<T: ?Sized + Hash> Hash for Box<T>`
 /// forwards for free and `&dyn Shim` is covered too. Hashing only reads, so
 /// one hidden method serves every marker combination.
+///
+/// The hidden method's body *is* a generic-argument erasure: `Hash::hash`'s
+/// `<H: Hasher>` used as `&mut H` lowers to `&mut dyn Hasher`. Rather than
+/// spelling that out, the method is generated by running a synthetic
+/// `fn(&self, state: &mut impl Hasher)` through [`erase_generic`], the same
+/// transform `#[dyn_shim(erase)]` applies to a source method — so this carrier
+/// is the first consumer of that shared substrate.
 fn expand_hash(shim: &Ident, combos: &[MarkerCombo]) -> (TokenStream2, TokenStream2, TokenStream2) {
+    let synthetic: TraitItemFn =
+        parse_quote! { fn __dyn_shim_hash(&self, state: &mut impl ::std::hash::Hasher); };
+    let erased = erase_generic(&synthetic.sig).expect("`Hash::hash` erases by construction");
+    let sig = &erased.sig;
+    let preamble = &erased.preamble;
+    let args = &erased.args;
     let sigs = quote! {
         #[doc(hidden)]
-        fn __dyn_shim_hash(&self, state: &mut dyn ::std::hash::Hasher);
+        #sig ;
     };
+    // Forward to `Hash::hash` rather than re-dispatching this hidden method:
+    // the erased signature and reborrowed arguments are shared, only the call
+    // target differs.
     let impls = quote! {
-        fn __dyn_shim_hash(&self, mut state: &mut dyn ::std::hash::Hasher) {
-            <__T as ::std::hash::Hash>::hash(self, &mut state)
+        #sig {
+            #preamble
+            <__T as ::std::hash::Hash>::hash(self #(, #args)*)
         }
     };
     // The carrier method `__dyn_shim_hash` is generated on the shim itself, so
@@ -526,6 +603,11 @@ fn expand_hash(shim: &Ident, combos: &[MarkerCombo]) -> (TokenStream2, TokenStre
 /// - It requires `Self: Sized` (such a method is excluded from the vtable).
 /// - It is annotated with `#[dyn_shim(skip)]`.
 ///
+/// Some of these are opt-in remediable rather than skipped: a generic parameter
+/// or `impl Trait` argument can be lowered with
+/// [`#[dyn_shim(erase)]`](#erasing-a-generic-argument), and a `-> Self` builder
+/// can be boxed with [`#[dyn_shim(boxed)]`](#reflexive-impl).
+///
 /// Skipped methods stay on the source trait and are reached on the concrete
 /// type. A forwarded method keeps its entire signature — lifetimes, `where`
 /// clause, parameter names, `unsafe`, and any explicit ABI — as well as its
@@ -535,6 +617,36 @@ fn expand_hash(shim: &Ident, combos: &[MarkerCombo]) -> (TokenStream2, TokenStre
 /// dereferencing the box. A dispatchable receiver (`&self`, `&mut self`, or an
 /// explicit `self: Box<Self>`, `Rc<Self>`, `Arc<Self>`, or `Pin<_>`) is
 /// forwarded unchanged.
+///
+/// ## Erasing a generic argument
+///
+/// A method that is non-dyn-compatible *only* because of a generic parameter or
+/// argument-position `impl Trait` can be kept rather than skipped, by annotating
+/// it `#[dyn_shim(erase)]`. Each such parameter must be bounded by a single
+/// trait and used only behind a `&` or `&mut`; the shim then lowers it to a
+/// trait object (`&mut impl Write` becomes `&mut dyn Write`), and forwarding
+/// reborrows the argument so the source method's parameter re-infers to the
+/// sized reference type. This is the same erasure the recognized `Hash` bound
+/// applies to `Hash::hash`'s generic hasher.
+///
+/// ```
+/// use dyn_shim::dyn_shim;
+/// use std::io::Write;
+///
+/// #[dyn_shim(DynLog)]
+/// trait Log {
+///     #[dyn_shim(erase)]
+///     fn write_to(&self, out: &mut impl Write); // shim: `out: &mut dyn Write`
+/// }
+///
+/// // `Box<dyn DynLog>` can call `write_to`, dispatched through the vtable.
+/// ```
+///
+/// It is sound exactly when the bound provides `impl Bound for &mut (dyn Bound)`
+/// (or `&(dyn Bound)`), as std does for `Hasher`, `Write`, `Read`, and others;
+/// a bound without that impl fails to compile at the forwarding call. A
+/// parameter used by value, in the return type, or in more than one argument
+/// cannot be erased, and the macro reports it at the method.
 ///
 /// # Reflexive Impl
 ///
@@ -559,10 +671,33 @@ fn expand_hash(shim: &Ident, combos: &[MarkerCombo]) -> (TokenStream2, TokenStre
 ///
 /// The impl must account for every method of the source trait. A dyn-compatible
 /// method forwards through the shim. A method that is not dyn-compatible (see
-/// [Method Selection](#method-selection)) cannot forward, so it must either have
-/// a default body on the source trait (which the impl inherits) or be annotated
-/// `#[dyn_shim(panic)]` to get a stub that panics if it is ever called through
-/// the shim. A method that is neither is a compile error naming it.
+/// [Method Selection](#method-selection)) cannot forward; the remediations, from
+/// most to least preferable, are:
+///
+/// - **Make it dispatch** — `#[dyn_shim(erase)]` (generic argument) or
+///   `#[dyn_shim(boxed)]` (`-> Self` builder, see below) turn it into a real
+///   forwarding rather than a stub.
+/// - **Inherit a default body** on the source trait, which the impl reuses.
+/// - **`where Self: Sized`** — on a `reflexive = bare` impl such a method is left
+///   out entirely (it is not part of the unsized object's surface), so calling it
+///   on a `&dyn DynFoo` is a compile error rather than a runtime panic. (The
+///   boxed object is `Sized`, so a `boxed` impl still needs one of the others.)
+/// - **A fallback body** for the erased impl: `#[dyn_shim(stub = <expr>)]`
+///   evaluates `<expr>` (e.g. `None`, `Default::default()`), letting the method
+///   degrade to a value; `#[dyn_shim(panic)]` is the special case that panics
+///   with a generated message. Unlike a default body, a stub leaves the source
+///   trait's method required of concrete implementors.
+///
+/// A method with none of these is a compile error naming it.
+///
+/// The `boxed` remediation, in detail: the shim method returns `Box<dyn DynFoo>`
+/// (the concrete result, boxed and unsized to the shim object), and the
+/// `reflexive = boxed` impl forwards through it, since there `Self` *is* `Box<dyn
+/// DynFoo>`. So a consuming or chaining builder keeps working on an erased value
+/// instead of panicking. This is the general form of the boxing the recognized
+/// `Clone` bound applies to `clone`; it requires `reflexive = boxed` (a `bare`
+/// impl has an unsized, unconstructible `Self`) and does not yet support
+/// auto-trait markers on the shim.
 ///
 /// ```
 /// use dyn_shim::dyn_shim;
@@ -587,8 +722,8 @@ fn expand_hash(shim: &Ident, combos: &[MarkerCombo]) -> (TokenStream2, TokenStre
 /// assert_eq!(eat(m), 7);
 /// ```
 ///
-/// The `reflexive` argument and the `#[dyn_shim(panic)]` helper work the same on
-/// [`macro@dyn_shim_foreign`].
+/// The `reflexive` argument and the `#[dyn_shim(panic)]` / `#[dyn_shim(boxed)]`
+/// helpers work the same on [`macro@dyn_shim_foreign`].
 ///
 /// # Bounds
 ///
@@ -1005,11 +1140,60 @@ pub fn dyn_shim(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// signature that does not match the real one is caught when the generated
 /// `<T as other_crate::Sink>::method(..)` call fails to compile.
 ///
+/// # Provided methods
+///
+/// A restated method with a **default body** is not forwarded: it is provided by
+/// the shim itself, emitted verbatim, with its body calling the shim's forwarded
+/// methods. Use it to add a convenience method that the foreign trait does not
+/// declare — the macro generates no `<T as Source>::method` call for it, so the
+/// foreign trait needs no counterpart. Such a method becomes part of the shim, so
+/// it must be dyn-compatible: a provided method that is not (a generic parameter,
+/// `async`, ...) is an error, since the shim is its only home and it would
+/// otherwise vanish. Make it dyn-compatible, or drop it. This is judged from the
+/// method's signature alone, so the same blind spot applies as elsewhere: a
+/// method made non-dyn-compatible only by a `where Self:` bound other than the
+/// literal `Sized` (see the dyn-compatibility limitations on [`macro@dyn_shim`])
+/// is not caught here. It is emitted as written and fails at the shim's first
+/// `dyn` use instead.
+///
+/// ```
+/// use dyn_shim::dyn_shim_foreign;
+///
+/// mod other_crate {
+///     pub trait Sink {
+///         fn total(&self) -> usize;
+///     }
+/// }
+///
+/// #[dyn_shim_foreign(other_crate::Sink)]
+/// trait DynSink {
+///     fn total(&self) -> usize;       // forwarded to `other_crate::Sink::total`
+///     fn doubled(&self) -> usize {    // provided: not on `Sink`, computed here
+///         self.total() * 2
+///     }
+/// }
+///
+/// struct Buf(usize);
+/// impl other_crate::Sink for Buf {
+///     fn total(&self) -> usize { self.0 }
+/// }
+///
+/// let s: Box<dyn DynSink> = Box::new(Buf(4));
+/// assert_eq!(s.doubled(), 8);
+/// ```
+///
+/// (In [`macro@dyn_shim`] a default body instead lives on the re-emitted source
+/// trait and is forwarded like any other method, so an implementor's override is
+/// still honored; only the foreign form, which has no source trait to hold it,
+/// provides the body on the shim.)
+///
 /// The trailing `reflexive = bare | boxed` argument
-/// (`#[dyn_shim_foreign(other_crate::Sink, reflexive = boxed)]`) and the
-/// `#[dyn_shim(panic)]` method helper work here too, emitting `impl
-/// other_crate::Sink for Box<dyn DynSink>` so the boxed shim satisfies the
-/// foreign trait. See [reflexive impl](macro@dyn_shim#reflexive-impl).
+/// (`#[dyn_shim_foreign(other_crate::Sink, reflexive = boxed)]`) and the method
+/// helpers (`#[dyn_shim(panic)]`, `#[dyn_shim(stub = ...)]`, `erase`, `boxed`)
+/// work here too, emitting `impl other_crate::Sink for Box<dyn DynSink>` so the
+/// boxed shim satisfies the foreign trait; a provided method is left out of that
+/// impl, since it is not a method of the foreign trait. See [reflexive
+/// impl](macro@dyn_shim#reflexive-impl).
 ///
 /// [method selection]: macro@dyn_shim#method-selection
 /// [bounds]: macro@dyn_shim#bounds
@@ -1082,27 +1266,41 @@ pub fn dyn_shim_recognized(attr: TokenStream, item: TokenStream) -> TokenStream 
     expand_recognized(&input, bounds)
 }
 
-/// Implement a recognized std trait (`Clone`, `Hash`) for the trait objects of
-/// an dyn-compatible trait you already own, without generating a shim.
+/// Make the trait objects of a dyn-compatible trait you already own satisfy
+/// another trait, without generating a shim, so `dyn YourTrait` gains a trait
+/// it cannot list as a supertrait.
 ///
 /// [`macro@dyn_shim`] and [`macro@dyn_shim_foreign`] build a *new*
-/// dyn-compatible trait from one that is not. This attribute is for the case
-/// where the trait is already dyn-compatible and you only want its `dyn`
-/// objects to gain a recognized capability. It generates no trait and no
-/// blanket impl: it re-emits the annotated trait untouched and adds the impls
-/// that make its trait objects `Clone` and/or `Hash`.
+/// dyn-compatible trait from one that is not. This attribute is the other half:
+/// the trait is already dyn-compatible, and you want its `dyn` objects to also
+/// satisfy some target trait. It generates no trait and no blanket impl — it
+/// re-emits the annotated trait untouched and invokes each listed carrier's
+/// bind macro, which stamps the `impl Target for dyn YourTrait` blocks.
 ///
-/// The capability rides on a carrier the trait must already inherit: list
-/// `DynClone` and/or `DynHash` (from this crate, behind the matching feature)
-/// as supertraits, and the attribute fills in the rest. The supertrait is
-/// written explicitly so a reader of the trait sees that every implementor must
-/// be `DynClone` / `DynHash`:
+/// A **carrier** is a trait the annotated trait inherits whose bind macro knows
+/// how to implement a target on a `dyn` type. Two kinds exist, reached the same
+/// way:
+///
+/// - The shipped [`DynClone`] / [`DynHash`] (behind the `dyn_clone` / `dyn_hash`
+///   features). Their target is `Clone` / `Hash`, which cannot be a supertrait
+///   of a dyn-compatible trait. `#[dyn_shim_bind(DynClone)]` makes `Box<dyn
+///   YourTrait>` cloneable (and `dyn YourTrait` `ToOwned`); `#[dyn_shim_bind(
+///   DynHash)]` makes `dyn YourTrait` (and so `&dyn` and `Box<dyn>`) hashable.
+/// - Any [`macro@dyn_shim`] shim `DynFoo`. Its target is the source trait `Foo`,
+///   which is not dyn-compatible. `#[dyn_shim_bind(DynFoo)]` makes `dyn YourTrait`
+///   and `Box<dyn YourTrait>` satisfy `Foo`, forwarding the dyn-compatible
+///   methods through the shim. This is how a non-dyn-compatible `Foo` reaches a
+///   trait object that could never list it as a supertrait: inherit `DynFoo`
+///   instead, then bind `Foo` back on.
+///
+/// The carrier is written as an explicit supertrait, so a reader sees that every
+/// implementor must satisfy it:
 ///
 /// ```
-/// use dyn_shim::{DynHash, trait_object};
+/// use dyn_shim::{DynHash, dyn_shim_bind};
 /// use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 ///
-/// #[trait_object(Hash)]
+/// #[dyn_shim_bind(DynHash)]
 /// trait Event: DynHash {
 ///     fn name(&self) -> &str;
 /// }
@@ -1119,32 +1317,41 @@ pub fn dyn_shim_recognized(attr: TokenStream, item: TokenStream) -> TokenStream 
 /// assert_eq!(bh.hash_one(&*boxed), bh.hash_one(&Tick(7)));
 /// ```
 ///
-/// `Clone` and `Hash` may be combined (`#[trait_object(Hash + Clone)]`), and
-/// auto-trait markers select the covered `dyn` variants exactly as in a
-/// [recognized bound](macro@dyn_shim#recognized-bounds): `#[trait_object(Clone +
-/// Send)]` makes both `Box<dyn Foo>` and `Box<dyn Foo + Send>` cloneable.
-/// `Clone` also implements `ToOwned` for the `dyn` type.
+/// Several carriers may be combined (`#[dyn_shim_bind(DynHash + DynClone)]`,
+/// `#[dyn_shim_bind(DynFoo + DynClone)]`), and auto-trait markers select the
+/// covered `dyn` variants exactly as for a [recognized
+/// bound](macro@dyn_shim#recognized-bounds): `#[dyn_shim_bind(DynClone + Send)]`
+/// makes both `Box<dyn YourTrait>` and `Box<dyn YourTrait + Send>` cloneable.
 ///
-/// # How It Differs From a Recognized Bound
+/// # The carrier is a supertrait, so the contract is strict
 ///
 /// `#[dyn_shim(DynFoo: Hash)]` generates a separate `DynFoo` shim and bounds its
 /// blanket impl by `Hash`, so a non-`Hash` implementor of `Foo` simply never
-/// becomes a `DynFoo`. `#[trait_object(Hash)]` adds no shim and instead requires
-/// the carrier as a supertrait of `Foo` itself, so the contract is stricter:
-/// *every* implementor of `Foo` must be `Hash`. Reach for this attribute when
-/// `Foo` is already dyn-compatible and `dyn Foo` is the type you use directly;
-/// reach for the shim when `Foo` is not dyn-compatible or when only some
-/// implementors are `Hash`.
+/// becomes a `DynFoo`. `#[dyn_shim_bind(...)]` adds no shim and instead requires
+/// the carrier as a supertrait of the annotated trait itself, so the contract is
+/// stricter: *every* implementor must satisfy the carrier. Reach for this
+/// attribute when the annotated trait is the `dyn` type you use directly; reach
+/// for a recognized bound on a shim when only some implementors qualify.
 ///
-/// Like the recognized bounds, the carrier supertrait is matched by bare name
-/// (`DynClone`, `DynHash`), the same token-match convention as the rest of the
-/// crate: a missing carrier is reported at the attribute, and a user trait that
-/// happens to be named `DynHash` is accepted in its place.
+/// # Relation to [`reflexive`](macro@dyn_shim#reflexive-impl)
+///
+/// Binding a shim carrier (`#[dyn_shim_bind(DynFoo)]`) and a `reflexive` impl are
+/// the same operation through the same generated macro: both stamp `impl Foo for
+/// <object>`. `reflexive` binds onto the shim's *own* objects (`dyn DynFoo`,
+/// `Box<dyn DynFoo>`) at the shim's definition; `#[dyn_shim_bind(DynFoo)]` binds
+/// onto a *different* principal that inherits the shim, anywhere `DynFoo` is in
+/// scope (including another crate).
+///
+/// The carrier is matched by the last segment of its path (`DynClone`,
+/// `DynHash`, `DynFoo`), the same token-match convention as the rest of the
+/// crate: a missing carrier supertrait is reported at the attribute. The carrier
+/// must be in scope as a macro at the use site, which its own import provides
+/// (`use krate::DynFoo` brings the trait and its bind macro together).
 #[proc_macro_attribute]
-pub fn trait_object(attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn dyn_shim_bind(attr: TokenStream, item: TokenStream) -> TokenStream {
     let BoundList { bounds } = parse_macro_input!(attr as BoundList);
     let input = parse_macro_input!(item as ItemTrait);
-    expand_trait_object(&input, bounds)
+    expand_dyn_shim_bind(&input, bounds)
 }
 
 /// If the annotated trait has any generic parameters, return the compile error
@@ -1165,7 +1372,7 @@ fn reject_generics(input: &ItemTrait, message: &str) -> Option<TokenStream> {
 /// order. `supertraits` is the auto-trait and pass-through bounds in listing
 /// order, ready to re-emit as a shim's supertraits. `passthrough` is just the
 /// plain pass-through bounds, kept for their spans: `dyn_shim` keeps them as
-/// supertraits, while `trait_object` and `dyn_shim_recognized` reject the first
+/// supertraits, while `dyn_shim_bind` and `dyn_shim_recognized` reject the first
 /// one. `rejected` pairs each known-impossible bound (`Copy`, `Ord`, ...) with
 /// its targeted message, in listing order. Duplicates are dropped silently,
 /// matching the language's own tolerance of `trait Foo: A + A`.
@@ -1214,126 +1421,115 @@ impl ClassifiedBounds {
     }
 }
 
-/// Expansion for [`macro@trait_object`]: re-emit the annotated trait unchanged
-/// and append the impls that make its `dyn` objects `Clone`/`Hash`. The carrier
-/// methods are inherited from the `DynClone`/`DynHash` supertraits, so unlike
-/// the recognized-bound machinery this emits only the bridge impls.
-fn expand_trait_object(
+/// Expansion for [`macro@dyn_shim_bind`]: re-emit the annotated trait unchanged
+/// and bind each listed carrier onto its `dyn` objects by invoking that
+/// carrier's generated bind macro. A carrier is any trait the annotated trait
+/// inherits whose bind macro stamps `impl Target for dyn Trait` — the shipped
+/// `DynClone`/`DynHash`, or a `#[dyn_shim]` shim. Auto traits in the list are
+/// markers selecting the covered `dyn` variants, exactly as for a recognized
+/// bound. This emits no impls itself; the linking lives entirely in the
+/// carriers' macros, shared with the `reflexive` option.
+fn expand_dyn_shim_bind(
     input: &ItemTrait,
     bounds: Punctuated<TypeParamBound, Token![+]>,
 ) -> TokenStream {
-    if let Some(err) = reject_generics(input, "trait_object does not support generic traits") {
+    if let Some(err) = reject_generics(input, "dyn_shim_bind does not support generic traits") {
         return err;
     }
 
-    let ClassifiedBounds {
-        recognized,
-        autos,
-        passthrough,
-        rejected,
-        ..
-    } = ClassifiedBounds::classify(&bounds);
-    if let Some((bound, msg)) = rejected.into_iter().next() {
-        return syn::Error::new_spanned(bound, msg)
-            .to_compile_error()
-            .into();
+    // Split the list: auto traits are markers, every other bound is a carrier to
+    // bind (named by its bind macro). A bare `Clone`/`Hash` names a capability
+    // rather than a carrier trait, so it is rejected toward the carrier to name.
+    let mut carriers: Vec<Path> = Vec::new();
+    let mut autos: Vec<AutoTrait> = Vec::new();
+    for bound in &bounds {
+        match Classified::of(bound) {
+            Classified::Auto(auto) => {
+                if !autos.contains(&auto) {
+                    autos.push(auto);
+                }
+            }
+            Classified::Recognized(_) => {
+                return syn::Error::new_spanned(
+                    bound,
+                    "name the carrier trait, not the capability: write `DynClone` / `DynHash` \
+                     (gated on the `dyn_clone` / `dyn_hash` feature) and inherit it as a supertrait",
+                )
+                .to_compile_error()
+                .into();
+            }
+            _ => {
+                let Some(path) = plain_trait_bound(bound) else {
+                    return syn::Error::new_spanned(
+                        bound,
+                        "a carrier must be a plain trait path (no `?`, no higher-ranked binder)",
+                    )
+                    .to_compile_error()
+                    .into();
+                };
+                carriers.push(path.clone());
+            }
+        }
     }
-    if let Some(bound) = passthrough.first() {
-        return syn::Error::new_spanned(
-            bound,
-            "trait_object expects recognized traits (`Clone` or `Hash`), optionally \
-             followed by auto-trait markers",
-        )
-        .to_compile_error()
-        .into();
-    }
-    if recognized.is_empty() {
+    if carriers.is_empty() {
         return syn::Error::new_spanned(
             &bounds,
-            "trait_object expects at least one recognized trait (`Clone` or `Hash`)",
+            "dyn_shim_bind expects at least one carrier trait to bind (`DynClone`, `DynHash`, \
+             or a `#[dyn_shim]` shim), optionally followed by auto-trait markers",
         )
         .to_compile_error()
         .into();
     }
 
-    // Each recognized capability rides on a carrier supertrait the annotated
-    // trait must already inherit. Report a missing one here, at the attribute,
-    // rather than letting the bridge's call to the inherited method fail to
-    // compile on generated code.
-    for k in &recognized {
-        if let Err(err) = k.require_carrier(input) {
+    // Each carrier must be inherited as a supertrait, so `dyn Trait: Carrier`
+    // holds and the generated impl's forwarding body type-checks. Report a missing
+    // one here, at the attribute, rather than as a macro-not-found or
+    // trait-bound error on generated code.
+    for carrier in &carriers {
+        if let Err(err) = require_carrier(input, carrier) {
             return err.to_compile_error().into();
         }
     }
 
     let trait_ident = &input.ident;
     let combos = MarkerCombo::all(&autos);
-    let mut bridges = TokenStream2::new();
-    for k in &recognized {
-        bridges.extend(k.trait_object_bridge(trait_ident, &combos));
+    let mut binds = TokenStream2::new();
+    for carrier in &carriers {
+        for MarkerCombo { markers, .. } in &combos {
+            binds.extend(quote! {
+                #carrier! { @bind (#trait_ident) ( #markers ) }
+            });
+        }
     }
 
     quote! {
         #input
-        #bridges
+        #binds
     }
     .into()
 }
 
-impl RecognizedBound {
-    /// Check that the annotated trait inherits the carrier supertrait this
-    /// capability needs (`DynClone` for `Clone`, `DynHash` for `Hash`). A
-    /// bare-name token match, like [`Classified::of`].
-    fn require_carrier(self, input: &ItemTrait) -> syn::Result<()> {
-        let (carrier, capability) = match self {
-            RecognizedBound::Clone => ("DynClone", "Clone"),
-            RecognizedBound::Hash => ("DynHash", "Hash"),
-        };
-        let present = input.supertraits.iter().any(|bound| {
-            plain_trait_bound(bound)
-                .and_then(|path| path.segments.last())
-                .is_some_and(|seg| seg.ident == carrier)
-        });
-        if present {
-            Ok(())
-        } else {
-            Err(syn::Error::new_spanned(
-                &input.ident,
-                format!(
-                    "trait_object({capability}) needs `{carrier}` as a supertrait; \
-                     write `trait {}: {carrier}`",
-                    input.ident
-                ),
-            ))
-        }
-    }
-
-    /// The bridge impls for this capability on `dyn TraitIdent + markers`, one
-    /// per marker combination. Each forwards to the carrier method inherited
-    /// from the `DynClone`/`DynHash` supertrait.
-    fn trait_object_bridge(self, trait_ident: &Ident, combos: &[MarkerCombo]) -> TokenStream2 {
-        let mut out = TokenStream2::new();
-        match self {
-            // `Hash` forwards through the inherited `DynHash` carrier, which
-            // erases the generic hasher to `&mut dyn Hasher`.
-            RecognizedBound::Hash => {
-                let carrier = quote! { ::dyn_shim::DynHash };
-                for MarkerCombo { markers, .. } in combos {
-                    out.extend(hash_bridge(trait_ident, markers, &carrier));
-                }
-            }
-            // `Clone` clones the concrete value into a fresh `Box<dyn Trait>`
-            // through `__clone_box`. Unlike the recognized-bound path there is no
-            // blanket impl to clone through, so it uses the fat-pointer carrier.
-            RecognizedBound::Clone => {
-                for MarkerCombo { markers, .. } in combos {
-                    out.extend(clone_bridge(trait_ident, markers, |recv| {
-                        quote! { ::dyn_shim::__clone_box(#recv) }
-                    }));
-                }
-            }
-        }
-        out
+/// Check that the annotated trait inherits `carrier` as a supertrait, matched by
+/// the carrier path's last segment (a bare-name token match, like
+/// [`Classified::of`]). Without it, `dyn Trait: Carrier` would not hold and the
+/// generated impl's forwarding call would fail to compile on generated code.
+fn require_carrier(input: &ItemTrait, carrier: &Path) -> syn::Result<()> {
+    let name = &carrier.segments.last().unwrap().ident;
+    let present = input.supertraits.iter().any(|bound| {
+        plain_trait_bound(bound)
+            .and_then(|path| path.segments.last())
+            .is_some_and(|seg| &seg.ident == name)
+    });
+    if present {
+        Ok(())
+    } else {
+        Err(syn::Error::new_spanned(
+            &input.ident,
+            format!(
+                "dyn_shim_bind needs `{name}` as a supertrait; write `trait {}: {name}`",
+                input.ident
+            ),
+        ))
     }
 }
 
@@ -1405,6 +1601,37 @@ fn expand(
         MarkerCombo::all(&autos)
     };
 
+    // A `#[dyn_shim(boxed)]` builder's shim method returns the marker-free
+    // `Box<dyn Shim>`, so a reflexive impl on a `+ marker` object form cannot be
+    // satisfied by it. Reject that combination up front rather than emit a type
+    // error on generated code; the boxed builder is still usable without markers.
+    //
+    // TODO: lift this gate. `build_boxed_method` already emits per-combo
+    // `Box<dyn Shim + markers>` (that is how the `Clone` carrier supports
+    // markers), so the blocker is only the forwarding side: a builder's reflexive
+    // impl forwards through the shared, combo-independent `@bind` entries, which
+    // cannot pick a per-combo method. Lifting it means emitting suffixed shim
+    // methods (`add`, `add_send`, ...) like `Clone`'s `__dyn_shim_clone_box`, and
+    // teaching the bind layer to route each combo's impl to the matching suffix
+    // — which `macro_rules!` cannot do today (it cannot derive a suffix ident
+    // from the `$($marker)*` tokens). That is a change to the bind machinery, not
+    // more sharing; see `build_bind_macro`.
+    if !reflexive.is_empty()
+        && !autos.is_empty()
+        && let Some(method) = items.iter().find_map(|item| match item {
+            TraitItem::Fn(m) if matches!(Helper::of(m), Some(Helper::Boxed)) => Some(m),
+            _ => None,
+        })
+    {
+        return syn::Error::new_spanned(
+            &method.sig.ident,
+            "#[dyn_shim(boxed)] does not yet support auto-trait markers on a reflexive shim: the \
+             boxed return `Box<dyn Shim>` cannot carry `+ Send` and similar",
+        )
+        .to_compile_error()
+        .into();
+    }
+
     // Validate the `#[dyn_shim(...)]` helper attributes: on a method the only
     // supported argument is `skip`; on any other trait item the attribute is
     // rejected outright. Only methods are stripped of it before the trait is
@@ -1443,12 +1670,50 @@ fn expand(
             continue;
         };
         match skip(method) {
-            Some(reason) => skipped.push((method.sig.ident.to_string(), reason)),
-            None => {
-                let (sig, body) = forward(method, source_ref);
-                sigs.push(sig);
-                impls.push(body);
+            // In the foreign form a method with a default body is shim-local
+            // (see `is_provided`): the shim itself is its only home, since there
+            // is no source trait to fall back to. If it is not dyn-compatible it
+            // cannot be a method of the shim at all, so its body would vanish
+            // silently. Error instead. (The local form re-emits the source trait
+            // with the default intact, where it is still reached on concrete
+            // types and through a reflexive impl, so a skip there loses nothing.)
+            // A `where Self: Sized` bound or any `#[dyn_shim(...)]` helper already
+            // states the intent, so neither errors here.
+            Some(reason)
+                if !reemit
+                    && method.default.is_some()
+                    && Helper::of(method).is_none()
+                    && !requires_self_sized(&method.sig) =>
+            {
+                let name = &method.sig.ident;
+                return syn::Error::new_spanned(
+                    &method.sig,
+                    format!(
+                        "`{name}` has a default body, so the `{shim_name}` shim provides it \
+                         directly, but it is not dyn-compatible ({reason}) and so cannot be a \
+                         method of the shim. Make it dyn-compatible, give it a `where Self: \
+                         Sized` bound, or remove it."
+                    ),
+                )
+                .to_compile_error()
+                .into();
             }
+            Some(reason) => skipped.push((method.sig.ident.to_string(), reason)),
+            // A foreign-shim method with a default body is shim-local: emit it
+            // verbatim (minus our helper attrs) so the shim trait carries it,
+            // and add no forwarding impl — the blanket impl inherits the default.
+            None if is_provided(method, reemit) => {
+                let mut provided = method.clone();
+                provided.attrs.retain(|a| !a.path().is_ident("dyn_shim"));
+                sigs.push(quote! { #provided });
+            }
+            None => match forward(method, &shim_name, source_ref) {
+                Ok((sig, body)) => {
+                    sigs.push(sig);
+                    impls.push(body);
+                }
+                Err(err) => return err.to_compile_error().into(),
+            },
         }
     }
 
@@ -1506,22 +1771,43 @@ fn expand(
         recognized_extra.extend(extra);
     }
 
-    // When requested, also emit `impl SourceTrait for <shim object>` for each
-    // requested kind (and each marker combination), so the shim's trait object
-    // satisfies the source trait. If any method cannot be placed in a requested
-    // impl, every such method is reported at once and the reflexive impls are
-    // omitted, leaving the shim and blanket impl above to compile on their own
-    // rather than cascading into an "unimplemented trait items" error on
-    // generated code.
+    // The forwarding bodies for each object form, computed once and shared by
+    // the bind macro and the `reflexive` invocations below. A form whose bodies
+    // do not type-check (a by-value `self` under `bare`, an unsupported receiver)
+    // is an `Err`, deferred: it surfaces only if `reflexive` actually requests
+    // that form, and is otherwise simply left out of the macro.
+    let bare_entries = reflexive_entries(ObjectForm::Bare, &shim_name, items, reemit);
+    let boxed_entries = reflexive_entries(ObjectForm::Boxed, &shim_name, items, reemit);
+
+    // Always emit the shim's bind macro (when any form is expressible), so a
+    // downstream `#[dyn_shim_bind(Shim)]` can bind the source trait onto its own
+    // principal even when this shim requested no reflexive impl of its own.
+    let bind_macro = build_bind_macro(&shim_name, source_ref, &bare_entries, &boxed_entries);
+
+    // When requested, bind the source trait onto the shim's own trait objects
+    // by invoking that macro, one form per requested kind and one call per marker
+    // combination, so the shim's trait object satisfies the source trait. A
+    // requested form that does not type-check reports its methods all at once
+    // (and the reflexive impls are omitted), rather than cascading into an
+    // "unimplemented trait items" error on generated code.
     let reflexive_impl = {
         let mut tokens = TokenStream2::new();
         let mut errors: Option<syn::Error> = None;
-        for kind in reflexive {
-            match build_reflexive(kind, &shim_name, source_ref, items, &combos) {
-                Ok(impls) => tokens.extend(impls),
+        for kind in &reflexive {
+            let (entries, tag) = match kind {
+                ObjectForm::Bare => (&bare_entries, quote! { @bare }),
+                ObjectForm::Boxed => (&boxed_entries, quote! { @boxed }),
+            };
+            match entries {
+                Ok(_) => {
+                    for MarkerCombo { markers, .. } in &combos {
+                        let self_ty = kind.ty(&shim_name, markers);
+                        tokens.extend(quote! { #shim_name! { #tag #self_ty } });
+                    }
+                }
                 Err(err) => match &mut errors {
-                    Some(acc) => acc.combine(err),
-                    None => errors = Some(err),
+                    Some(acc) => acc.combine(err.clone()),
+                    None => errors = Some(err.clone()),
                 },
             }
         }
@@ -1546,6 +1832,8 @@ fn expand(
         }
 
         #recognized_extra
+
+        #bind_macro
 
         #reflexive_impl
     }
@@ -1631,6 +1919,10 @@ fn expand_recognized(
     let (sigs, impls, extra) = recognized.expand(shim, &combos);
     let impl_bound = recognized.impl_bound();
     let doc = recognized.doc_line(shim);
+    // The bind macro that backs `#[dyn_shim_bind(Carrier)]`: stamps this
+    // capability's bridge impls onto an arbitrary principal that inherits the
+    // carrier. Named after the carrier so the carrier's import carries it.
+    let bind_arm = recognized.bind_arm(shim);
 
     quote! {
         #(#attrs)*
@@ -1645,6 +1937,15 @@ fn expand_recognized(
         }
 
         #extra
+
+        #[allow(non_local_definitions)]
+        #[macro_export]
+        #[doc(hidden)]
+        macro_rules! #shim {
+            (@bind ($principal:path) ($($marker:tt)*)) => {
+                #bind_arm
+            };
+        }
     }
     .into()
 }
@@ -1680,6 +1981,295 @@ fn cfg_gates(method: &TraitItemFn) -> Vec<&Attribute> {
         .collect()
 }
 
+/// A method whose generic parameters have been lowered to trait objects, ready
+/// to drop into a vtable. Produced by [`erase_generic`] and consumed both by
+/// `#[dyn_shim(erase)]` source methods (via [`forward_erased`]) and by the
+/// `Hash` carrier's hidden hashing method (via [`expand_hash`]).
+struct ErasedFn {
+    /// The dyn-compatible signature: every erased type parameter removed from
+    /// the generics and its `&P` / `&mut P` argument retyped to `&dyn Bound` /
+    /// `&mut dyn Bound`, with arguments renamed for forwarding.
+    sig: Signature,
+    /// `let mut <arg> = <arg>;` rebindings for each erased mutable argument, so
+    /// the reborrow below has a mutable place to point at.
+    preamble: TokenStream2,
+    /// One forwarding expression per argument after the receiver: a reborrow
+    /// (`&<arg>` / `&mut <arg>`) for an erased argument so the callee's type
+    /// parameter re-infers to the sized reference type, the plain name
+    /// otherwise.
+    args: Vec<TokenStream2>,
+}
+
+/// How an erased argument is reborrowed when forwarding.
+#[derive(Clone, Copy)]
+enum Erased {
+    /// `&P` was lowered to `&dyn Bound`; forward `&arg`.
+    Shared,
+    /// `&mut P` was lowered to `&mut dyn Bound`; forward `&mut arg` (needs a
+    /// `let mut` rebinding).
+    Mut,
+    /// `&[mut] P` for a `?Sized` parameter `P` was lowered to `&[mut] dyn Bound`;
+    /// forward `arg` itself. Because `P: ?Sized`, the source method's parameter
+    /// can infer to the unsized `dyn Bound` directly, which an object-safe bound
+    /// satisfies on its own. No reborrow, so no `impl Bound for &[mut] dyn Bound`
+    /// is required (the reborrowing `Shared` / `Mut` paths do need one).
+    Direct,
+}
+
+/// Lower a method's generic parameters, each bounded by a single trait and used
+/// only behind a reference, to `&dyn Bound` / `&mut dyn Bound`. This is the
+/// transform behind `#[dyn_shim(erase)]`: a generic argument such as `w: &mut
+/// impl Write` (or a named `<W: Write>` used as `&mut W`) cannot enter a vtable,
+/// but `w: &mut dyn Write` can. How the argument forwards depends on whether the
+/// parameter is `Sized`:
+///
+/// - A `Sized` parameter (a named `<W: Write>` or an `impl Write`) cannot be the
+///   unsized `dyn Write`, so forwarding reborrows the argument (`&mut w`) and the
+///   source's type parameter re-infers to the sized reference type `&mut dyn
+///   Write`. Sound exactly when std (or the bound's author) provides `impl Bound
+///   for &mut (dyn Bound)` — true for `Hasher`, `Write`, `Read`, and friends.
+/// - A `?Sized` parameter (a named `<W: Write + ?Sized>`) forwards the lowered
+///   object directly, so the source's type parameter infers to `dyn Write`
+///   itself. That needs no reference-forwarding impl, only that the bound be
+///   object-safe (so `dyn Write: Write` holds).
+///
+/// The recognized [`Hash`](RecognizedBound::Hash) carrier is the proof case for
+/// the reborrow path: its hidden hashing method is this transform applied to
+/// `fn(&self, &mut impl Hasher)`.
+///
+/// Returns `Err` for a parameter that cannot be erased — a const generic, more
+/// than one trait bound, a use by value or in the return type, or a use in more
+/// than one argument (which would force one inferred reference type onto two
+/// independent trait objects) — so the caller reports it where the user opted in.
+fn erase_generic(sig: &Signature) -> syn::Result<ErasedFn> {
+    let mut sig = sig.clone();
+
+    // Each erasable type parameter, the single trait path it is bounded by (the
+    // only shape that lowers to one `dyn Bound`), and whether it relaxes `Sized`.
+    // A `?Sized` parameter forwards its lowered object directly rather than by
+    // reborrow; lifetime bounds are kept out of the count.
+    let mut params: Vec<(Ident, Path, bool)> = Vec::new();
+    for param in &sig.generics.params {
+        match param {
+            GenericParam::Lifetime(_) => {}
+            GenericParam::Const(c) => {
+                return Err(syn::Error::new_spanned(
+                    c,
+                    "#[dyn_shim(erase)] cannot erase a const generic parameter to a trait object",
+                ));
+            }
+            GenericParam::Type(t) => {
+                let traits: Vec<&Path> = t.bounds.iter().filter_map(plain_trait_bound).collect();
+                let [path] = traits.as_slice() else {
+                    return Err(syn::Error::new_spanned(
+                        t,
+                        format!(
+                            "#[dyn_shim(erase)] needs `{}` to have exactly one trait bound to \
+                             lower it to a single `dyn Bound`",
+                            t.ident
+                        ),
+                    ));
+                };
+                let maybe_sized = t.bounds.iter().any(is_maybe_sized);
+                params.push((t.ident.clone(), (*path).clone(), maybe_sized));
+            }
+        }
+    }
+
+    // Walk the arguments, retyping each `&[mut] P` / `&[mut] impl Bound` referent
+    // to `dyn Bound` and recording how to reborrow it. A parameter must appear in
+    // exactly one argument; track uses to reject zero (nothing to erase) or many
+    // (one inferred type cannot serve two objects).
+    let mut uses: Vec<usize> = vec![0; params.len()];
+    let mut erased: Vec<Option<Erased>> = Vec::new();
+    for arg in sig.inputs.iter_mut().skip(1) {
+        let FnArg::Typed(pat) = arg else { continue };
+        erased.push(erase_arg_ty(&mut pat.ty, &params, &mut uses)?);
+    }
+
+    // A parameter used outside a single reference argument — in the return type,
+    // by value, or more than once — cannot be erased.
+    if let ReturnType::Type(_, ty) = &sig.output
+        && let Some((ident, _, _)) = params.iter().find(|(id, _, _)| type_mentions_ident(ty, id))
+    {
+        return Err(syn::Error::new_spanned(
+            ty,
+            format!("#[dyn_shim(erase)] cannot erase `{ident}`: it appears in the return type"),
+        ));
+    }
+    for ((ident, _, _), count) in params.iter().zip(&uses) {
+        if *count == 0 {
+            return Err(syn::Error::new_spanned(
+                ident,
+                format!(
+                    "#[dyn_shim(erase)] cannot erase `{ident}`: it is not used behind a `&` or \
+                     `&mut` argument (only such uses lower to a trait object)"
+                ),
+            ));
+        }
+        if *count > 1 {
+            return Err(syn::Error::new_spanned(
+                ident,
+                format!(
+                    "#[dyn_shim(erase)] cannot erase `{ident}`: it is used in more than one \
+                     argument, which would force one reference type onto independent objects"
+                ),
+            ));
+        }
+    }
+
+    // Drop the erased parameters (now all type parameters) and any `where`
+    // predicate bounding them, leaving only lifetimes.
+    let erased_idents: Vec<&Ident> = params.iter().map(|(id, _, _)| id).collect();
+    sig.generics.params = std::mem::take(&mut sig.generics.params)
+        .into_iter()
+        .filter(|p| !matches!(p, GenericParam::Type(t) if erased_idents.contains(&&t.ident)))
+        .collect();
+    if sig.generics.params.is_empty() {
+        sig.generics.lt_token = None;
+        sig.generics.gt_token = None;
+    }
+    if let Some(where_clause) = &mut sig.generics.where_clause {
+        where_clause.predicates = std::mem::take(&mut where_clause.predicates)
+            .into_iter()
+            .filter(|pred| !predicate_bounds_any(pred, &erased_idents))
+            .collect();
+        if where_clause.predicates.is_empty() {
+            sig.generics.where_clause = None;
+        }
+    }
+
+    // Rename arguments and build the reborrow forwarding expressions.
+    let mut preamble = TokenStream2::new();
+    let mut args = Vec::new();
+    for (i, (arg, kind)) in sig.inputs.iter_mut().skip(1).zip(&erased).enumerate() {
+        let FnArg::Typed(pat) = arg else { continue };
+        let name = match &*pat.pat {
+            Pat::Ident(p) if p.by_ref.is_none() && p.subpat.is_none() => p.ident.clone(),
+            _ => format_ident!("__a{i}"),
+        };
+        *pat.pat = parse_quote! { #name };
+        match kind {
+            Some(Erased::Mut) => {
+                preamble.extend(quote! { let mut #name = #name; });
+                args.push(quote! { &mut #name });
+            }
+            Some(Erased::Shared) => args.push(quote! { & #name }),
+            // A `?Sized` parameter's object, and any non-erased argument, forward
+            // by name.
+            Some(Erased::Direct) | None => args.push(quote! { #name }),
+        }
+    }
+
+    Ok(ErasedFn {
+        sig,
+        preamble,
+        args,
+    })
+}
+
+/// Retype one argument if it is a `&[mut] P` / `&[mut] impl Bound` that can be
+/// erased, returning how to reborrow it. `params` maps a named parameter to its
+/// bound; `uses` counts named-parameter uses for the single-use check. A named
+/// parameter mentioned anywhere but as a bare reference referent is left for the
+/// caller's by-value / return-type checks to reject.
+fn erase_arg_ty(
+    ty: &mut Type,
+    params: &[(Ident, Path, bool)],
+    uses: &mut [usize],
+) -> syn::Result<Option<Erased>> {
+    let Type::Reference(reference) = ty else {
+        return Ok(None);
+    };
+    let reborrow = if reference.mutability.is_some() {
+        Erased::Mut
+    } else {
+        Erased::Shared
+    };
+    let (bound, kind): (Path, Erased) = match &*reference.elem {
+        // `&[mut] P` for a named parameter P. A `?Sized` parameter forwards its
+        // object directly (`Erased::Direct`); a sized one reborrows.
+        Type::Path(p) if p.qself.is_none() => {
+            let Some(idx) = p
+                .path
+                .get_ident()
+                .and_then(|id| params.iter().position(|(pid, _, _)| pid == id))
+            else {
+                return Ok(None);
+            };
+            uses[idx] += 1;
+            let (_, path, maybe_sized) = &params[idx];
+            let kind = if *maybe_sized {
+                Erased::Direct
+            } else {
+                reborrow
+            };
+            (path.clone(), kind)
+        }
+        // `&[mut] impl Bound` (argument-position impl Trait), an anonymous
+        // single-bounded parameter. An `impl Trait` parameter is always `Sized`,
+        // so it always reborrows.
+        Type::ImplTrait(it) => {
+            let traits: Vec<&Path> = it.bounds.iter().filter_map(plain_trait_bound).collect();
+            let [path] = traits.as_slice() else {
+                return Err(syn::Error::new_spanned(
+                    it,
+                    "#[dyn_shim(erase)] needs the `impl Trait` argument to have exactly one \
+                     trait bound to lower it to a single `dyn Bound`",
+                ));
+            };
+            ((*path).clone(), reborrow)
+        }
+        _ => return Ok(None),
+    };
+    *reference.elem = parse_quote! { dyn #bound };
+    Ok(Some(kind))
+}
+
+/// True if a bound is a `?Sized` relaxation (`Sized` with the maybe modifier),
+/// which marks a type parameter that may be unsized.
+fn is_maybe_sized(bound: &syn::TypeParamBound) -> bool {
+    matches!(
+        bound,
+        syn::TypeParamBound::Trait(t)
+            if matches!(t.modifier, syn::TraitBoundModifier::Maybe(_)) && t.path.is_ident("Sized")
+    )
+}
+
+/// True if a type mentions the given identifier as a path segment.
+fn type_mentions_ident(ty: &Type, ident: &Ident) -> bool {
+    struct Finder<'a> {
+        ident: &'a Ident,
+        hit: bool,
+    }
+    impl<'ast, 'a> Visit<'ast> for Finder<'a> {
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            if path.is_ident(self.ident) {
+                self.hit = true;
+            }
+            visit::visit_path(self, path);
+        }
+    }
+    let mut finder = Finder { ident, hit: false };
+    finder.visit_type(ty);
+    finder.hit
+}
+
+/// True if a `where` predicate bounds one of the given (erased) parameters, so
+/// it can be dropped alongside them.
+fn predicate_bounds_any(pred: &syn::WherePredicate, idents: &[&Ident]) -> bool {
+    let syn::WherePredicate::Type(pred) = pred else {
+        return false;
+    };
+    let Type::Path(bounded) = &pred.bounded_ty else {
+        return false;
+    };
+    bounded
+        .path
+        .get_ident()
+        .is_some_and(|id| idents.contains(&id))
+}
+
 /// Build the shim signature and the forwarding impl body for one method.
 ///
 /// The shim method reuses the source method's entire signature (`unsafe`, ABI,
@@ -1692,7 +2282,23 @@ fn cfg_gates(method: &TraitItemFn) -> Vec<&Attribute> {
 ///
 /// `src` is how the source trait is named in the forwarding call: its own ident
 /// for a local source trait, or a path for a foreign one.
-fn forward(method: &TraitItemFn, src: &TokenStream2) -> (TokenStream2, TokenStream2) {
+///
+/// A method marked `#[dyn_shim(erase)]` is routed through [`forward_erased`],
+/// which lowers its generic parameters to trait objects, and one marked
+/// `#[dyn_shim(boxed)]` through [`forward_boxed`], which boxes a `-> Self`
+/// return into `Box<dyn shim>`. Both can fail (a generic used by value, a
+/// non-`Self` return, ...), so this returns a `Result`.
+fn forward(
+    method: &TraitItemFn,
+    shim: &Ident,
+    src: &TokenStream2,
+) -> syn::Result<(TokenStream2, TokenStream2)> {
+    match Helper::of(method) {
+        Some(Helper::Erase) => return forward_erased(method, src),
+        Some(Helper::Boxed) => return forward_boxed(method, shim, src),
+        _ => {}
+    }
+
     let mut sig = method.sig.clone();
 
     let Some(FnArg::Receiver(recv)) = sig.inputs.first() else {
@@ -1736,27 +2342,185 @@ fn forward(method: &TraitItemFn, src: &TokenStream2) -> (TokenStream2, TokenStre
             <__T as #src>::#name(#self_expr #(, #names)*)
         }
     };
-    (shim_sig, shim_impl)
+    Ok((shim_sig, shim_impl))
 }
 
-/// Build the reflexive `impl SourceTrait for <shim object>` blocks, one per
-/// marker combination. Each source method either forwards to the shim, gets a
-/// panicking stub (`#[dyn_shim(panic)]`), or is omitted to inherit a trait
-/// default body. Every method that cannot be placed is collected, so the
-/// caller reports them all in one pass.
-fn build_reflexive(
+/// Build the shim signature and forwarding body for an `#[dyn_shim(erase)]`
+/// method, lowering its generic parameters to trait objects via
+/// [`erase_generic`]. The shim method is non-generic and so enters the vtable,
+/// while the forwarding call reborrows each erased argument so the source
+/// method's type parameter re-infers to the sized reference type.
+///
+/// Receiver handling matches [`forward`]: a by-value `self` becomes `self:
+/// Box<Self>`, forwarded by dereference.
+fn forward_erased(
+    method: &TraitItemFn,
+    src: &TokenStream2,
+) -> syn::Result<(TokenStream2, TokenStream2)> {
+    let ErasedFn {
+        mut sig,
+        preamble,
+        args,
+    } = erase_generic(&method.sig)?;
+
+    let Some(FnArg::Receiver(recv)) = sig.inputs.first() else {
+        unreachable!("skip guarantees a receiver")
+    };
+    let self_expr = if matches!(ReceiverKind::of(recv), ReceiverKind::Value) {
+        sig.inputs[0] = parse_quote! { self: ::std::boxed::Box<Self> };
+        quote! { *self }
+    } else {
+        quote! { self }
+    };
+
+    let attrs: Vec<&Attribute> = method
+        .attrs
+        .iter()
+        .filter(|a| !a.path().is_ident("dyn_shim"))
+        .collect();
+    let cfg_attrs = cfg_gates(method);
+
+    let name = &sig.ident;
+    let shim_sig = quote! {
+        #(#attrs)*
+        #sig ;
+    };
+    let shim_impl = quote! {
+        #(#cfg_attrs)*
+        #[allow(deprecated)]
+        #sig {
+            #preamble
+            <__T as #src>::#name(#self_expr #(, #args)*)
+        }
+    };
+    Ok((shim_sig, shim_impl))
+}
+
+/// Build the shim signature and forwarding body for a `#[dyn_shim(boxed)]`
+/// method: a `-> Self` builder made dyn-compatible by boxing its result into
+/// `Box<dyn shim>`. `Self` would be unsized as the trait object, so it cannot
+/// be returned directly; the shim returns the boxed object instead, and the
+/// blanket impl boxes the concrete result (which unsizes to `Box<dyn shim>`
+/// because the implementor is `shim` and the method requires `Self: 'static`).
+/// A `reflexive = boxed` impl can then satisfy the source `-> Self`, since there
+/// `Self` *is* `Box<dyn shim>`. This is the general form of the boxing the
+/// recognized `Clone` bound applies to `clone`.
+///
+/// Errors (reported where the user opted in) when the shape cannot be boxed: a
+/// return that is not exactly `Self`, a generic method, or `Self` used in an
+/// argument (only the return is boxed).
+fn forward_boxed(
+    method: &TraitItemFn,
+    shim: &Ident,
+    src: &TokenStream2,
+) -> syn::Result<(TokenStream2, TokenStream2)> {
+    let ReturnType::Type(_, ret) = &method.sig.output else {
+        return Err(syn::Error::new_spanned(
+            &method.sig.ident,
+            "#[dyn_shim(boxed)] expects a method returning `Self`, to box into the shim object",
+        ));
+    };
+    if !is_bare_self(ret) {
+        return Err(syn::Error::new_spanned(
+            ret,
+            "#[dyn_shim(boxed)] expects the return type to be exactly `Self`; only a bare `Self` \
+             can be boxed into the shim's trait object",
+        ));
+    }
+    // TODO: support `boxed` + `erase` together, for a generic `-> Self` builder
+    // such as `fn with<T: Into<X>>(self, t: T) -> Self`. A method carries one
+    // `#[dyn_shim(...)]` helper today, and the two transforms are applied by
+    // separate forwarders (`forward_erased` / `forward_boxed`). Composing them is
+    // mechanical — they touch disjoint parts of the signature (erase rewrites the
+    // arguments and generics, boxing rewrites the return) — but needs a way to
+    // request both on one method and a single forwarder that runs `erase_generic`
+    // and then boxes the result.
+    if has_type_or_const_generics(&method.sig) {
+        return Err(syn::Error::new_spanned(
+            &method.sig.ident,
+            "#[dyn_shim(boxed)] cannot apply to a generic method (combining it with `erase` is \
+             not yet supported)",
+        ));
+    }
+    for arg in method.sig.inputs.iter().skip(1) {
+        if let FnArg::Typed(pat) = arg
+            && type_finds(&pat.ty, true, false)
+        {
+            return Err(syn::Error::new_spanned(
+                &pat.ty,
+                "#[dyn_shim(boxed)] cannot forward a method that mentions `Self` in an argument; \
+                 only a `-> Self` return is boxed",
+            ));
+        }
+    }
+
+    let mut sig = method.sig.clone();
+    let Some(FnArg::Receiver(recv)) = sig.inputs.first() else {
+        unreachable!("skip guarantees a receiver")
+    };
+    let self_expr = if matches!(ReceiverKind::of(recv), ReceiverKind::Value) {
+        sig.inputs[0] = parse_quote! { self: ::std::boxed::Box<Self> };
+        quote! { *self }
+    } else {
+        quote! { self }
+    };
+
+    let name = method.sig.ident.clone();
+    let names = rename_args(&mut sig);
+    // Box the forwarded source call into the shim object. No markers: a boxed
+    // builder's reflexive impl forwards through the shared, combo-independent
+    // bind entries (unlike `Clone`'s dedicated per-combo bridge), so the
+    // marker-free `Box<dyn shim>` is all that path can satisfy — the marker
+    // combination is rejected up front in `expand`.
+    let call = quote! { <__T as #src>::#name(#self_expr #(, #names)*) };
+    let (sig, body) = build_boxed_method(shim, &TokenStream2::new(), sig, call);
+
+    let attrs: Vec<&Attribute> = method
+        .attrs
+        .iter()
+        .filter(|a| !a.path().is_ident("dyn_shim"))
+        .collect();
+    let cfg_attrs = cfg_gates(method);
+
+    let shim_sig = quote! {
+        #(#attrs)*
+        #sig ;
+    };
+    let shim_impl = quote! {
+        #(#cfg_attrs)*
+        #[allow(deprecated)]
+        #sig { #body }
+    };
+    Ok((shim_sig, shim_impl))
+}
+
+/// Build the forwarding method bodies for an `impl SourceTrait for <shim
+/// object>` in one object form. Each source method either forwards to the shim,
+/// gets a panicking stub (`#[dyn_shim(panic)]`), or is omitted to inherit a
+/// trait default body. Every method that cannot be placed is collected, so the
+/// caller reports them all in one pass. The entries are independent of the
+/// principal (they reference `self`/`&**self` and the shim's methods, with
+/// `Self` resolving to the impl's self type), so the same set serves the shim's
+/// own objects (the `reflexive` option) and any downstream principal that
+/// inherits the shim (`#[dyn_shim_bind(Shim)]`).
+///
+/// A shim-provided method (see [`is_provided`]) is left out entirely: it is not
+/// a method of the source trait, so it has no place in `impl SourceTrait`.
+fn reflexive_entries(
     kind: ObjectForm,
     shim: &Ident,
-    source_ref: &TokenStream2,
     items: &[TraitItem],
-    combos: &[MarkerCombo],
-) -> syn::Result<TokenStream2> {
+    reemit: bool,
+) -> syn::Result<Vec<TokenStream2>> {
     let mut entries = Vec::new();
     let mut errors: Option<syn::Error> = None;
     for item in items {
         let TraitItem::Fn(method) = item else {
             continue;
         };
+        if is_provided(method, reemit) {
+            continue;
+        }
         match reflexive_method(kind, shim, method) {
             Ok(Some(entry)) => entries.push(entry),
             // A non-forwardable method with a default body is left off the
@@ -1768,49 +2532,120 @@ fn build_reflexive(
             },
         }
     }
-    if let Some(err) = errors {
-        return Err(err);
+    match errors {
+        Some(err) => Err(err),
+        None => Ok(entries),
     }
+}
 
-    let mut out = TokenStream2::new();
-    for MarkerCombo { markers, .. } in combos {
-        let self_ty = kind.ty(shim, markers);
-        out.extend(quote! {
-            impl #source_ref for #self_ty {
-                #(#entries)*
-            }
+/// Build the shim's bind macro: a `macro_rules!` named after the shim that
+/// stamps `impl SourceTrait for <object>`, forwarding through the shim. It backs
+/// both the `reflexive` option (binding onto the shim's own `dyn`/`Box` types)
+/// and a downstream `#[dyn_shim_bind(Shim)]` (binding onto any principal that
+/// inherits the shim). The arms:
+///
+/// - `@bare`/`@boxed` take a fully formed self type and stamp one form's impl;
+///   the `reflexive` invocations use these, since they choose the form.
+/// - `@bind` takes a principal trait path plus the marker tokens of one
+///   combination and stamps every *expressible* form; `#[dyn_shim_bind]` uses
+///   this single uniform entry, shared with the recognized carriers.
+///
+/// Only the forms whose forwarding bodies type-check are emitted. The macro is
+/// exported (so a downstream crate can bind through it) and named after the
+/// shim, so the shim's own import carries it (`use krate::Shim` brings the trait
+/// and the macro, which live in different namespaces). It is `#[doc(hidden)]`,
+/// and `#[allow(non_local_definitions)]` keeps it quiet when a shim is declared
+/// inside a function body (as a doctest's implicit `main` does).
+fn build_bind_macro(
+    shim: &Ident,
+    source_ref: &TokenStream2,
+    bare: &syn::Result<Vec<TokenStream2>>,
+    boxed: &syn::Result<Vec<TokenStream2>>,
+) -> TokenStream2 {
+    let mut arms = TokenStream2::new();
+    let mut bind_impls = TokenStream2::new();
+    if let Ok(entries) = bare {
+        arms.extend(quote! {
+            (@bare $self_ty:ty) => {
+                impl #source_ref for $self_ty { #(#entries)* }
+            };
+        });
+        bind_impls.extend(quote! {
+            impl #source_ref for dyn $principal $($marker)* { #(#entries)* }
         });
     }
-    Ok(out)
+    if let Ok(entries) = boxed {
+        arms.extend(quote! {
+            (@boxed $self_ty:ty) => {
+                impl #source_ref for $self_ty { #(#entries)* }
+            };
+        });
+        bind_impls.extend(quote! {
+            impl #source_ref for ::std::boxed::Box<dyn $principal $($marker)*> { #(#entries)* }
+        });
+    }
+    if arms.is_empty() {
+        // Neither form forwards (every method is non-dyn-compatible without a
+        // stub or default), so there is nothing to bind and no macro to emit.
+        return TokenStream2::new();
+    }
+    quote! {
+        #[allow(non_local_definitions)]
+        #[macro_export]
+        #[doc(hidden)]
+        macro_rules! #shim {
+            #arms
+            (@bind ($principal:path) ($($marker:tt)*)) => {
+                #bind_impls
+            };
+        }
+    }
 }
 
 /// Build one method of the reflexive impl. `Ok(Some(..))` is a method to emit,
-/// `Ok(None)` omits it (a non-forwardable method with a trait default body
-/// inherits that default), and `Err` reports a method that cannot be placed in
-/// the impl at all.
+/// `Ok(None)` omits it, and `Err` reports a method that cannot be placed in the
+/// impl at all. A non-forwardable method is omitted when it has a trait default
+/// body (inherited) or, on the bare form, when it requires `Self: Sized` (not
+/// part of the unsized object's surface); otherwise it needs a stub helper
+/// (`#[dyn_shim(panic)]` / `#[dyn_shim(stub = ...)]`).
 fn reflexive_method(
     kind: ObjectForm,
     shim: &Ident,
     method: &TraitItemFn,
 ) -> syn::Result<Option<TokenStream2>> {
-    let forwardable = skip(method).is_none();
-    let stub = if forwardable {
-        false
-    } else if method.default.is_some() {
-        return Ok(None);
-    } else if Helper::of(method) == Some(Helper::Panic) {
-        true
+    let name = &method.sig.ident;
+
+    let stub_body = if skip(method).is_none() {
+        // Forwardable: dispatched through the shim below.
+        None
     } else {
-        let name = &method.sig.ident;
-        let reason = skip(method).unwrap_or("not dyn-compatible");
-        return Err(syn::Error::new_spanned(
-            name,
-            format!(
-                "`{name}` is not dyn-compatible ({reason}), so the reflexive impl cannot \
-                 forward it; annotate it `#[dyn_shim(panic)]` to provide a panicking stub, \
-                 or give it a default body"
-            ),
-        ));
+        // A `where Self: Sized` method is excluded from the unsized bare
+        // object's surface, so `impl Foo for dyn Shim` need not provide it:
+        // omit it. Calling it on a `&dyn Shim` is then a compile error rather
+        // than a runtime panic. (The boxed object is `Sized`, so it still needs
+        // a stub or default.)
+        if kind == ObjectForm::Bare && requires_self_sized(&method.sig) {
+            return Ok(None);
+        }
+        // A default body on the source trait is inherited by the impl.
+        if method.default.is_some() {
+            return Ok(None);
+        }
+        // Otherwise a stub helper must supply a fallback body.
+        match Helper::of(method).and_then(|h| h.stub_body(shim, name)) {
+            Some(body) => Some(body),
+            None => {
+                let reason = skip(method).unwrap_or("not dyn-compatible");
+                return Err(syn::Error::new_spanned(
+                    name,
+                    format!(
+                        "`{name}` is not dyn-compatible ({reason}), so the reflexive impl cannot \
+                         forward it; provide a fallback with `#[dyn_shim(panic)]` or \
+                         `#[dyn_shim(stub = <expr>)]`, or give it a default body"
+                    ),
+                ));
+            }
+        }
     };
 
     // `reflexive = bare` impls for the unsized `dyn` type, so an emitted method
@@ -1828,28 +2663,30 @@ fn reflexive_method(
     let names = rename_args(&mut sig);
     let cfg_attrs = cfg_gates(method);
 
-    let body = if stub {
-        let msg = format!(
-            "`{}` is not available on the type-erased `{shim}` shim",
-            method.sig.ident
-        );
-        quote! { ::std::panic!(#msg) }
-    } else {
-        let name = &method.sig.ident;
-        let recv = match sig.inputs.first() {
-            Some(FnArg::Receiver(recv)) => recv,
-            _ => unreachable!("a forwarded method has a receiver"),
-        };
-        let recv_expr = kind.reflexive_receiver(recv, name)?;
-        // Dispatch through the shim trait by name, so `Self` infers to the
-        // `dyn` type (vtable dispatch to the concrete implementor). Calling the
-        // source method on `self` instead would resolve right back to this impl
-        // and recurse.
-        quote! { #shim::#name(#recv_expr #(, #names)*) }
+    // A stub body (`panic` / `stub = ...`) typically ignores the arguments, so
+    // silence the unused-variable warnings the restated signature would draw.
+    let stub_allow = stub_body
+        .is_some()
+        .then(|| quote! { #[allow(unused_variables)] });
+    let body = match stub_body {
+        Some(body) => body,
+        None => {
+            let recv = match sig.inputs.first() {
+                Some(FnArg::Receiver(recv)) => recv,
+                _ => unreachable!("a forwarded method has a receiver"),
+            };
+            let recv_expr = kind.reflexive_receiver(recv, name)?;
+            // Dispatch through the shim trait by name, so `Self` infers to the
+            // `dyn` type (vtable dispatch to the concrete implementor). Calling
+            // the source method on `self` instead would resolve right back to
+            // this impl and recurse.
+            quote! { #shim::#name(#recv_expr #(, #names)*) }
+        }
     };
 
     Ok(Some(quote! {
         #(#cfg_attrs)*
+        #stub_allow
         #[allow(deprecated)]
         #sig { #body }
     }))
@@ -2035,51 +2872,114 @@ fn shim_doc(
     lines
 }
 
-/// A `#[dyn_shim(...)]` helper attribute on a method. `skip` and `panic` are
-/// the supported arguments.
-#[derive(Clone, Copy, PartialEq)]
+/// A `#[dyn_shim(...)]` helper attribute on a method.
+#[derive(Clone)]
 enum Helper {
     /// `#[dyn_shim(skip)]`: leave the method off the shim entirely.
     Skip,
-    /// `#[dyn_shim(panic)]`: when a reflexive impl is generated, give this
-    /// method a panicking stub there (for methods that cannot forward through
-    /// the shim).
-    Panic,
+    /// `#[dyn_shim(erase)]`: lower the method's generic parameters (each bounded
+    /// by a single trait and used only behind a reference) to `&dyn Bound` /
+    /// `&mut dyn Bound` so the method enters the shim's vtable, instead of being
+    /// skipped as non-dyn-compatible. See [`erase_generic`].
+    Erase,
+    /// `#[dyn_shim(boxed)]`: forward a `-> Self` builder by boxing its result
+    /// into the shim's trait object, so the shim method returns `Box<dyn Shim>`
+    /// and a `reflexive = boxed` impl can satisfy the source `-> Self` (where
+    /// `Self` is the boxed object). See [`forward_boxed`]; this is the general
+    /// case of the boxing the recognized `Clone` bound applies to `clone`.
+    Boxed,
+    /// A fallback body for a method that cannot forward through the shim, used in
+    /// a reflexive impl. `#[dyn_shim(panic)]` is `Stub(None)` (panic with a
+    /// generated message); `#[dyn_shim(stub = <expr>)]` is `Stub(Some(expr))`,
+    /// letting the method degrade to a value (`None`, `Default::default()`, ...)
+    /// instead of aborting. See [`Helper::stub_body`].
+    Stub(Option<Expr>),
+}
+
+/// A shim method that carries its own body, so it is *provided* by the shim
+/// rather than forwarded to the source trait. Only in the foreign form: a
+/// [`macro@dyn_shim_foreign`] method with a default body is shim-local — the
+/// foreign trait need not declare it — so it is emitted verbatim on the shim
+/// trait and left out of the blanket impl, the reflexive impl, and the bind
+/// macro. Its body calls the shim's other (forwarded) methods.
+///
+/// In the local form a default body lives on the re-emitted source trait, where
+/// forwarding still honors an implementor's override, so a defaulted method is
+/// forwarded like any other and this returns `false`.
+fn is_provided(method: &TraitItemFn, reemit: bool) -> bool {
+    !reemit && method.default.is_some()
 }
 
 /// If a method cannot be dispatched through a trait object, return a short
 /// reason it is skipped. Return `None` when the method is forwarded.
 fn skip(method: &TraitItemFn) -> Option<&'static str> {
     let sig = &method.sig;
-    if Helper::of(method) == Some(Helper::Skip) {
+    // `#[dyn_shim(erase)]` keeps a method that is non-dyn-compatible only because
+    // of its generic parameters or argument-position `impl Trait`: `erase_generic`
+    // lowers those to trait objects. `#[dyn_shim(boxed)]` keeps a `-> Self`
+    // builder, boxing the return into the shim object. Neither can rescue a
+    // method for any other reason (no receiver, async, ...), so those still skip;
+    // `forward_erased` / `forward_boxed` then report any opt-in they cannot honor.
+    let helper = Helper::of(method);
+    let erasing = matches!(helper, Some(Helper::Erase));
+    let boxing = matches!(helper, Some(Helper::Boxed));
+    if matches!(helper, Some(Helper::Skip)) {
         Some("opted out with #[dyn_shim(skip)]")
     } else if sig.asyncness.is_some() {
         Some("async fn")
     } else if !has_self_receiver(sig) {
         Some("no self receiver")
-    } else if has_type_or_const_generics(sig) {
+    } else if has_type_or_const_generics(sig) && !erasing {
         Some("generic type or const parameter")
     } else if requires_self_sized(sig) {
         Some("requires Self: Sized")
-    } else if signature_mentions_self_or_impl_trait(sig) {
-        Some("mentions Self or impl Trait")
+    } else if signature_mentions_self(sig) && !boxing {
+        Some("mentions Self")
+    } else if signature_mentions_impl_trait(sig) && !erasing {
+        Some("uses impl Trait")
     } else {
         None
     }
 }
 
 impl Helper {
+    /// The fallback body for a non-forwardable method's reflexive stub, if this
+    /// helper supplies one. `#[dyn_shim(panic)]` (`Stub(None)`) panics with a
+    /// generated message naming the method and shim; `#[dyn_shim(stub = <expr>)]`
+    /// (`Stub(Some(expr))`) evaluates `<expr>` instead, letting the method
+    /// degrade to a value (`None`, `Default::default()`, ...) rather than abort.
+    /// Other helpers supply no stub.
+    fn stub_body(&self, shim: &Ident, name: &Ident) -> Option<TokenStream2> {
+        match self {
+            Helper::Stub(None) => {
+                let msg = format!("`{name}` is not available on the type-erased `{shim}` shim");
+                Some(quote! { ::std::panic!(#msg) })
+            }
+            Helper::Stub(Some(expr)) => Some(quote! { #expr }),
+            _ => None,
+        }
+    }
+
     /// Parse a method's `#[dyn_shim(...)]` attribute, which must carry exactly
-    /// one of the supported arguments, `skip` or `panic`.
+    /// one supported argument.
     fn parse(attr: &Attribute) -> syn::Result<Helper> {
         let mut helper = None;
         attr.parse_nested_meta(|meta| {
             let which = if meta.path.is_ident("skip") {
                 Helper::Skip
             } else if meta.path.is_ident("panic") {
-                Helper::Panic
+                Helper::Stub(None)
+            } else if meta.path.is_ident("erase") {
+                Helper::Erase
+            } else if meta.path.is_ident("boxed") {
+                Helper::Boxed
+            } else if meta.path.is_ident("stub") {
+                Helper::Stub(Some(meta.value()?.parse()?))
             } else {
-                return Err(meta.error("unsupported dyn_shim argument, expected `skip` or `panic`"));
+                return Err(meta.error(
+                    "unsupported dyn_shim argument, expected `skip`, `panic`, `erase`, `boxed`, \
+                     or `stub = <expr>`",
+                ));
             };
             if helper.replace(which).is_some() {
                 return Err(meta.error("duplicate dyn_shim argument"));
@@ -2087,7 +2987,11 @@ impl Helper {
             Ok(())
         })?;
         helper.ok_or_else(|| {
-            syn::Error::new_spanned(attr, "expected #[dyn_shim(skip)] or #[dyn_shim(panic)]")
+            syn::Error::new_spanned(
+                attr,
+                "expected #[dyn_shim(skip)], #[dyn_shim(panic)], #[dyn_shim(erase)], \
+                 #[dyn_shim(boxed)], or #[dyn_shim(stub = <expr>)]",
+            )
         })
     }
 
@@ -2140,38 +3044,57 @@ fn has_type_or_const_generics(sig: &Signature) -> bool {
         .any(|p| !matches!(p, GenericParam::Lifetime(_)))
 }
 
-/// True if the return type or any argument type mentions `Self` or `impl
-/// Trait`.
-fn signature_mentions_self_or_impl_trait(sig: &Signature) -> bool {
-    let return_bad =
-        matches!(&sig.output, ReturnType::Type(_, ty) if mentions_self_or_impl_trait(ty));
+/// True if the return type or any argument type mentions `Self`.
+fn signature_mentions_self(sig: &Signature) -> bool {
+    signature_any_type(sig, |ty| type_finds(ty, true, false))
+}
 
+/// True if the return type or any argument type uses `impl Trait`. Split from
+/// the `Self` check because `#[dyn_shim(erase)]` can rescue `impl Trait` (by
+/// lowering it to a trait object) but never `Self`.
+fn signature_mentions_impl_trait(sig: &Signature) -> bool {
+    signature_any_type(sig, |ty| type_finds(ty, false, true))
+}
+
+/// True if `pred` holds for the return type or any argument type after the
+/// receiver.
+fn signature_any_type(sig: &Signature, pred: impl Fn(&Type) -> bool) -> bool {
+    let return_bad = matches!(&sig.output, ReturnType::Type(_, ty) if pred(ty));
     let arg_bad = sig
         .inputs
         .iter()
         .skip(1)
-        .any(|arg| matches!(arg, FnArg::Typed(pat) if mentions_self_or_impl_trait(&pat.ty)));
-
+        .any(|arg| matches!(arg, FnArg::Typed(pat) if pred(&pat.ty)));
     return_bad || arg_bad
 }
 
-/// True if a type mentions `Self` or uses `impl Trait`, either of which makes a
-/// method non-dyn-compatible.
-fn mentions_self_or_impl_trait(ty: &Type) -> bool {
-    struct Finder(bool);
+/// Whether a type mentions `Self` and/or uses `impl Trait`, each toggled by a
+/// flag. Either makes a method non-dyn-compatible.
+fn type_finds(ty: &Type, find_self: bool, find_impl_trait: bool) -> bool {
+    struct Finder {
+        find_self: bool,
+        find_impl_trait: bool,
+        hit: bool,
+    }
     impl<'ast> Visit<'ast> for Finder {
         fn visit_path(&mut self, path: &'ast syn::Path) {
-            if path.segments.iter().any(|s| s.ident == "Self") {
-                self.0 = true;
+            if self.find_self && path.segments.iter().any(|s| s.ident == "Self") {
+                self.hit = true;
             }
             visit::visit_path(self, path);
         }
         fn visit_type_impl_trait(&mut self, it: &'ast syn::TypeImplTrait) {
-            self.0 = true;
+            if self.find_impl_trait {
+                self.hit = true;
+            }
             visit::visit_type_impl_trait(self, it);
         }
     }
-    let mut finder = Finder(false);
+    let mut finder = Finder {
+        find_self,
+        find_impl_trait,
+        hit: false,
+    };
     finder.visit_type(ty);
-    finder.0
+    finder.hit
 }

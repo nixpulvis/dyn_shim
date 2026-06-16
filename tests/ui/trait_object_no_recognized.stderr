@@ -1,5 +1,0 @@
-error: trait_object expects at least one recognized trait (`Clone` or `Hash`)
- --> tests/ui/trait_object_no_recognized.rs:5:16
-  |
-5 | #[trait_object(Send)]
-  |                ^^^^

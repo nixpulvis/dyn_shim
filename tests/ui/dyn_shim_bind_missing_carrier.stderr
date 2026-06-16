@@ -1,0 +1,5 @@
+error: dyn_shim_bind needs `DynHash` as a supertrait; write `trait Foo: DynHash`
+ --> tests/ui/dyn_shim_bind_missing_carrier.rs:8:7
+  |
+8 | trait Foo {
+  |       ^^^

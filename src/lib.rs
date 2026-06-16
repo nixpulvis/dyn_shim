@@ -13,20 +13,24 @@
 //! By default the shim is a separate trait. A [reflexive
 //! impl](macro@dyn_shim#reflexive-impl) (`reflexive = bare | boxed`) also makes
 //! the shim's trait object satisfy the source trait itself, so it can be passed
-//! to code written against the original.
+//! to code written against the original. [`macro@dyn_shim_bind`] does the same
+//! for a *different* trait object: it binds the shim's source trait (or the
+//! shipped `Clone`/`Hash` carriers) onto a dyn-compatible trait you own, so
+//! `dyn YourTrait` satisfies a trait it could not list as a supertrait.
 //!
 //! # Dyn `Clone` and `Hash`
 //!
-//! `Clone` and `Hash` cannot be supertraits of a dyn-compatible trait, so they
-//! cannot be shimmed by restating them. This crate ships their shims directly,
-//! each behind a feature, as drop-in equivalents of the `dyn_clone` and
-//! `dyn_hash` crates:
+//! A dyn-compatible trait cannot have `Clone` or `Hash` as a supertrait, so a
+//! shim cannot carry them the way it carries an ordinary supertrait. Instead,
+//! list `Clone`/`Hash` as [bounds](macro@dyn_shim#recognized-bounds) on a
+//! [`macro@dyn_shim`] shim. The macro recognizes them and generates the
+//! cloning/hashing machinery on the shim directly, so a `Box<dyn Shim>` is
+//! cloneable and a `dyn Shim` is hashable. This works without any crate
+//! features, or `unsafe` code.
 //!
-//! To give a trait of your own these capabilities, list `Clone`/`Hash` as
-//! [bounds](macro@dyn_shim#recognized-bounds) on a [`macro@dyn_shim`] shim, or,
-//! when the trait is already dyn-compatible, add them to its trait objects in
-//! place with [`macro@trait_object`] (gated on the `dyn_clone` and `dyn_hash`
-//! features).
+//! The `dyn_clone` and `dyn_hash` features are separate. They ship the
+//! standalone [`DynClone`] and [`DynHash`] carrier traits, drop-in equivalents
+//! of the `dyn_clone` and `dyn_hash` crates:
 //!
 //! - With the `dyn_clone` feature, [`DynClone`]: `Box<dyn DynClone>` implements
 //! [`Clone`] and `dyn DynClone` implements [`ToOwned`].
@@ -35,14 +39,21 @@
 //! forwarding impl.
 //!
 //! Both cover the `+ Send` and `+ Sync` marker variants.
+//!
+//! You need these features only to use [`DynClone`]/[`DynHash`] themselves and
+//! to bind them onto a trait which is already dyn-compatible of your own with
+//! [`macro@dyn_shim_bind`], so its trait objects gain cloning or hashing. With
+//! the feature enabled, a recognized `Clone`/`Hash` bound on a `#[dyn_shim]`
+//! shim additionally makes the shim a subtrait of the matching carrier, so its
+//! `dyn` type upcasts into `dyn DynClone`/`dyn DynHash`.
 
 pub use dyn_shim_macros::{dyn_shim, dyn_shim_foreign};
 
-// `trait_object` only implements `Clone`/`Hash`, whose carriers are `DynClone`
-// and `DynHash`. With neither feature on there is no carrier to bolt onto a
-// trait, so the attribute would be unusable; gate it on having at least one.
-#[cfg(any(feature = "dyn_clone", feature = "dyn_hash"))]
-pub use dyn_shim_macros::trait_object;
+// `dyn_shim_bind` binds any carrier onto a trait's objects — a `#[dyn_shim]`
+// shim, or the shipped `DynClone`/`DynHash` (those two behind their features).
+// A shim carrier needs no feature, so the attribute is always available; the
+// `DynClone`/`DynHash` carriers it can name simply do not exist without them.
+pub use dyn_shim_macros::dyn_shim_bind;
 
 // The machinery behind the ready-made shims below. It is not part of this
 // crate's public API (the shims are), so it is re-exported only to define them
@@ -76,7 +87,7 @@ pub trait DynClone {}
 
 /// Clone the concrete value behind a `dyn` trait object that carries the
 /// [`DynClone`] machinery, into a fresh `Box` of that same trait object type.
-/// This backs the [`trait_object`](macro@trait_object) attribute's `Clone`
+/// This backs the [`dyn_shim_bind`](macro@dyn_shim_bind) attribute's `Clone`
 /// support: a `Box<dyn Foo>` where `Foo: DynClone` is cloned by duplicating the
 /// underlying concrete value and re-boxing it as `dyn Foo`.
 ///

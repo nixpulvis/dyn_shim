@@ -1,0 +1,5 @@
+error: dyn_shim_bind expects at least one carrier trait to bind (`DynClone`, `DynHash`, or a `#[dyn_shim]` shim), optionally followed by auto-trait markers
+ --> tests/ui/dyn_shim_bind_no_recognized.rs:5:17
+  |
+5 | #[dyn_shim_bind(Send)]
+  |                 ^^^^
