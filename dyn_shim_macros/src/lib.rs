@@ -1266,9 +1266,9 @@ pub fn dyn_shim_recognized(attr: TokenStream, item: TokenStream) -> TokenStream 
     expand_recognized(&input, bounds)
 }
 
-/// Bind a *carrier* onto the trait objects of a dyn-compatible trait you
-/// already own, so `dyn YourTrait` satisfies a trait it cannot carry as a
-/// supertrait — without generating a shim.
+/// Make the trait objects of a dyn-compatible trait you already own satisfy
+/// another trait, without generating a shim, so `dyn YourTrait` gains a trait
+/// it cannot list as a supertrait.
 ///
 /// [`macro@dyn_shim`] and [`macro@dyn_shim_foreign`] build a *new*
 /// dyn-compatible trait from one that is not. This attribute is the other half:

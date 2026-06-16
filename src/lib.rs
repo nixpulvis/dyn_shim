@@ -20,23 +20,32 @@
 //!
 //! # Dyn `Clone` and `Hash`
 //!
-//! `Clone` and `Hash` cannot be supertraits of a dyn-compatible trait, so they
-//! cannot be shimmed by restating them. This crate ships their shims directly,
-//! each behind a feature, as drop-in equivalents of the `dyn_clone` and
-//! `dyn_hash` crates:
+//! A dyn-compatible trait cannot have `Clone` or `Hash` as a supertrait, so a
+//! shim cannot carry them the way it carries an ordinary supertrait. Instead,
+//! list `Clone`/`Hash` as [bounds](macro@dyn_shim#recognized-bounds) on a
+//! [`macro@dyn_shim`] shim. The macro recognizes them and generates the
+//! cloning/hashing machinery on the shim directly, so a `Box<dyn Shim>` is
+//! cloneable and a `dyn Shim` is hashable. This works without any crate
+//! features, or `unsafe` code.
+//!
+//! The `dyn_clone` and `dyn_hash` features are separate. They ship the
+//! standalone [`DynClone`] and [`DynHash`] carrier traits, drop-in equivalents
+//! of the `dyn_clone` and `dyn_hash` crates:
 //!
 //! - With the `dyn_clone` feature, [`DynClone`]: `Box<dyn DynClone>` implements
-//!   [`Clone`] and `dyn DynClone` implements [`ToOwned`].
+//! [`Clone`] and `dyn DynClone` implements [`ToOwned`].
 //! - With the `dyn_hash` feature, [`DynHash`]: `dyn DynHash` implements
-//!   [`Hash`], covering `Box<dyn DynHash>` through the standard library's
-//!   forwarding impl.
+//! [`Hash`], covering `Box<dyn DynHash>` through the standard library's
+//! forwarding impl.
 //!
 //! Both cover the `+ Send` and `+ Sync` marker variants.
 //!
-//! To give a trait of your own these capabilities, list `Clone`/`Hash` as
-//! [bounds](macro@dyn_shim#recognized-bounds) on a [`macro@dyn_shim`] shim, or,
-//! when the trait is already dyn-compatible, bind the `DynClone`/`DynHash`
-//! carriers onto its trait objects with [`macro@dyn_shim_bind`].
+//! You need these features only to use [`DynClone`]/[`DynHash`] themselves and
+//! to bind them onto a trait which is already dyn-compatible of your own with
+//! [`macro@dyn_shim_bind`], so its trait objects gain cloning or hashing. With
+//! the feature enabled, a recognized `Clone`/`Hash` bound on a `#[dyn_shim]`
+//! shim additionally makes the shim a subtrait of the matching carrier, so its
+//! `dyn` type upcasts into `dyn DynClone`/`dyn DynHash`.
 
 pub use dyn_shim_macros::{dyn_shim, dyn_shim_foreign};
 

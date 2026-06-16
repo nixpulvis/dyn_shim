@@ -16,10 +16,11 @@ dyn_shim = "0.2"
 ```rust
 use dyn_shim::dyn_shim;
 
-// Not dyn-compatible: `build` returns `Self`, so `Box<dyn Parser>` is impossible.
+// Creates a DynParser trait with the dyn-compatible subset of Parser's methods.
 #[dyn_shim(DynParser)]
 trait Parser {
     fn parse(&self, input: &str) -> usize;
+    // Not dyn-compatible: returns `Self`, so `Box<dyn Parser>` is impossible.
     fn build() -> Self;
 }
 
@@ -35,8 +36,9 @@ impl Parser for Bytes {
     fn build() -> Self { Bytes }
 }
 
-// `DynParser` is dyn-compatible, so a heterogeneous set lives behind one type.
-let parsers: Vec<Box<dyn DynParser>> = vec![Box::new(Words), Box::new(Bytes)];
+let parsers: Vec<Box<dyn DynParser>> = vec![
+    Box::new(Words::build()),
+    Box::new(Bytes::build())];
 let total: usize = parsers.iter().map(|p| p.parse("a b c")).sum();
 assert_eq!(total, 3 + 5);
 ```
@@ -73,11 +75,7 @@ The [`examples/`](examples) directory has one runnable program per feature:
   `Hash` bounds, making boxed shim objects cloneable and hashable.
 - [`bind.rs`](examples/bind.rs) - `#[dyn_shim_bind]`, binding the
   `DynClone` / `DynHash` carriers and a `#[dyn_shim]` shim onto a trait that is
-  already dyn-compatible. This is also the migration path from the
-  [`dyn-clone`](https://crates.io/crates/dyn-clone) and
-  [`dyn-hash`](https://crates.io/crates/dyn-hash) crates, replacing their
-  `clone_trait_object!` / `hash_trait_object!` calls. Needs
-  `--features "dyn_clone dyn_hash"`.
+  already dyn-compatible.
 - [`reflexive.rs`](examples/reflexive.rs) - `reflexive` impls that let erased
   objects flow back into source-trait-generic code, plus the `erase` / `stub` /
   `panic` / `boxed` remediations for methods that cannot forward.

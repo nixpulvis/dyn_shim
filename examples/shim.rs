@@ -1,18 +1,17 @@
-//! The core of the crate: turn a trait that is not dyn-compatible into one that
-//! is, so a mixed set of implementors can live behind a single `Box<dyn _>`.
+//! The core of the crate which turns a trait that is not dyn-compatible into
+//! one that is by exposing the dyn-compatible subset of it's methods.
 //!
 //! `Channel` is not dyn-compatible. It has a receiverless `connect() -> Self`
-//! constructor and a by-value `close(self)` shutdown, so you cannot hold a mixed
-//! list of channel types behind one `Box<dyn Channel>`.
+//! constructor and a by-value `close(self)` shutdown, so you cannot hold a
+//! mixed list of channel types behind one `Box<dyn Channel>`.
 //!
 //! `#[dyn_shim(DynChannel)]` reads the trait and generates a dyn-compatible
 //! `DynChannel` shim plus a blanket `impl<T: Channel> DynChannel for T`. Each
 //! method that can ride a vtable is forwarded:
 //!
-//! - `label`, `set_prefix`, and `deliver` forward unchanged.
-//! - the by-value `close(self)` is rewritten to `close(self: Box<Self>)`.
-//! - the receiverless `connect` cannot ride a vtable, so it is skipped; call it
-//!   on the concrete type before erasing.
+//! - All of `label`, `set_prefix`, and `deliver` forward unchanged.
+//! - The by-value `close(self)` is rewritten to `close(self: Box<Self>)`.
+//! - The receiverless `connect` cannot ride a vtable, so it is skipped.
 //!
 //! Every `Channel` implementor is now a `DynChannel`, so `Box<dyn DynChannel>`
 //! holds any of them.
@@ -89,8 +88,8 @@ impl Channel for Webhook {
 }
 
 fn main() {
-    // Different channel types behind one boxed trait object. `connect` is called
-    // on the concrete type, since it cannot be reached through the shim.
+    // Different channel types behind one boxed trait object. `connect` is
+    // called on the concrete type, since it cannot be reached through the shim.
     let mut channels: Vec<Box<dyn DynChannel>> =
         vec![Box::new(Email::connect()), Box::new(Webhook::connect())];
 

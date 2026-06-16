@@ -32,6 +32,8 @@ jobs:
       run: cargo build --verbose --features "${{ matrix.features }}"
     - name: Run tests
       run: cargo test --verbose --features "${{ matrix.features }}"
+    - name: Run doc tests
+      run: cargo test --workspace --doc --verbose --features "${{ matrix.features }}"
 
   miri:
 

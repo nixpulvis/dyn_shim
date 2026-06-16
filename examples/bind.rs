@@ -5,37 +5,46 @@
 //! `dyn Product` works on its own. What it lacks is `Clone` and `Hash` on the
 //! boxed object, and the ability to satisfy `Priced` (which is not
 //! dyn-compatible). `#[dyn_shim]` would answer by generating a separate shim
-//! trait, but here `dyn Product` is the type used directly, so a second trait is
-//! not wanted.
+//! trait, but here `dyn Product` is the type used directly, so a second trait
+//! is not wanted.
 //!
-//! `#[dyn_shim_bind(..)]` generates no new trait. It re-emits `Product` untouched
-//! and stamps `impl Target for dyn Product` blocks, one per *carrier* it is
-//! given. A carrier is a supertrait whose bind machinery knows how to implement a
-//! target on a `dyn` type. Two kinds exist:
+//! `#[dyn_shim_bind(..)]` generates no new trait. It re-emits `Product`
+//! untouched and stamps `impl Target for dyn Product` blocks, one per *carrier*
+//! it is given. A carrier is a supertrait whose bind machinery knows how to
+//! implement a target on a `dyn` type. Two kinds exist:
 //!
 //! - **Shipped carriers** `DynClone` / `DynHash` (behind the `dyn_clone` /
-//!   `dyn_hash` features). Their targets are `Clone` / `Hash`, neither of which
-//!   can be a supertrait of a dyn-compatible trait. Binding them makes `Box<dyn
-//!   Product>` cloneable and `dyn Product` hashable. This is the drop-in
-//!   replacement for `dyn-clone`'s `clone_trait_object!(Product)` and
-//!   `dyn-hash`'s `hash_trait_object!(Product)`.
+//! `dyn_hash` features). Their targets are `Clone` / `Hash`, neither of which
+//! can be a supertrait of a dyn-compatible trait. Binding them makes `Box<dyn
+//! Product>` cloneable and `dyn Product` hashable. This is the drop-in
+//! replacement for `dyn-clone`'s `clone_trait_object!(Product)` and
+//! `dyn-hash`'s `hash_trait_object!(Product)`.
 //! - **A `#[dyn_shim]` shim** `DynPriced`. Its target is the source trait
-//!   `Priced`, which is not dyn-compatible. Binding it makes `dyn Product` and
-//!   `Box<dyn Product>` satisfy `Priced`, forwarding the dispatchable methods
-//!   through the shim. This is how a non-dyn-compatible `Priced` reaches a trait
-//!   object that could never list it as a supertrait.
+//! `Priced`, which is not dyn-compatible. Binding it makes `dyn Product` and
+//! `Box<dyn Product>` satisfy `Priced`, forwarding the dispatchable methods
+//! through the shim. This is how a non-dyn-compatible `Priced` reaches a trait
+//! object that could never list it as a supertrait.
 //!
 //! Each carrier is written as an explicit supertrait, so every `Product`
 //! implementor must satisfy all three.
 //!
-//! Run with: `cargo run --example bind --features "dyn_clone dyn_hash"`
+//! Binding a shim is a reflexive operation: each `impl Priced for dyn Product`
+//! and `impl Priced for Box<dyn Product>` it stamps must supply every method of
+//! `Priced`. A `Priced` method that cannot forward through the shim must
+//! therefore carry a stub or a default body, or `DynPriced` cannot be bound at
+//! all. That is why `quote` is annotated `#[dyn_shim(panic)]`, without it,
+//! `DynPriced` produces no `impl Priced` block, and
+//! `#[dyn_shim_bind(DynPriced + ...)]` fails because there is no `DynPriced`
+//! binding macro to invoke.
+//!
+//! Run with: `cargo run --example bind --features dyn_clone,dyn_hash`
 
 use dyn_shim::{DynClone, DynHash, dyn_shim, dyn_shim_bind};
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher, Hash};
 
-// `Priced` is not dyn-compatible: `quote` is generic over its return type, so it
-// cannot ride a vtable. `#[dyn_shim(DynPriced)]` builds a dyn-compatible shim of
-// the dispatchable methods, which `Product` will inherit and bind back.
+// `Priced` is not dyn-compatible: `quote` is generic over its return type, so
+// it cannot ride a vtable. `#[dyn_shim(DynPriced)]` builds a dyn-compatible
+// shim of the dispatchable methods, which `Product` will inherit and bind back.
 #[dyn_shim(DynPriced)]
 trait Priced {
     fn price(&self) -> u32;
@@ -97,7 +106,7 @@ impl Product for Sticker {
     }
 }
 
-// Generic over `Priced` by reference: a `&dyn Product` satisfies it, no allocation.
+// Generic over `Priced` by reference: a `&dyn Product` satisfies it.
 fn shelf_price(p: &(impl Priced + ?Sized)) -> u32 {
     p.price()
 }
@@ -123,7 +132,7 @@ fn main() {
         }),
     ];
 
-    // DynClone carrier: Box<dyn Product> is Clone, so the whole catalog duplicates.
+    // DynClone carrier: Box<dyn Product> is Clone.
     let copy = catalog.clone();
     println!(
         "catalog: {} items, copy: {} items",
@@ -138,12 +147,12 @@ fn main() {
         // DynPriced shim carrier: &dyn Product is accepted as a &impl Priced.
         println!("shelf price: {}", shelf_price(&**product));
 
-        // DynHash carrier: dyn Product is Hash, hashing like the concrete value.
+        // DynHash carrier: dyn Product is Hash, hashing the concrete value.
         println!("fingerprint: {:016x}", fingerprint(&**product));
     }
 
-    // `quote` is generic, so on an erased product it is the panicking stub. Call
-    // it on the concrete type, before erasing.
+    // `quote` is generic, so on an erased product it is the panicking stub.
+    // Call it on the concrete type, before erasing.
     let quote: u64 = Book {
         sku: "BOOK-1".into(),
         cents: 1200,
