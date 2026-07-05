@@ -1,0 +1,451 @@
+\documentclass[aspectratio=169]{beamer}
+
+% Build with: tectonic talk/slides.tex
+
+\usetheme{default}
+\usefonttheme{professionalfonts}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}[frame number]
+\setbeamertemplate{itemize items}[circle]
+
+\usepackage{listings}
+\usepackage{xcolor}
+
+\definecolor{accent}{RGB}{183,65,14}      % rust orange
+\definecolor{keyword}{RGB}{0,92,153}
+\definecolor{comment}{RGB}{96,128,96}
+\definecolor{string}{RGB}{136,0,0}
+\definecolor{macro}{RGB}{122,62,157}
+\definecolor{codebg}{RGB}{247,247,245}
+
+\setbeamercolor{frametitle}{fg=accent}
+\setbeamercolor{title}{fg=accent}
+\setbeamercolor{structure}{fg=accent}
+\setbeamerfont{frametitle}{series=\bfseries}
+\setbeamertemplate{blocks}[rounded][shadow=false]
+\setbeamercolor{block title alerted}{fg=string,bg=string!12}
+\setbeamercolor{block body alerted}{fg=black,bg=string!4}
+
+\lstdefinelanguage{Rust}{
+  keywords={as,break,const,continue,crate,dyn,else,enum,extern,false,fn,for,
+    if,impl,in,let,loop,match,mod,move,mut,pub,ref,return,static,struct,
+    super,trait,true,type,unsafe,use,where,while,async,await,self,Self},
+  sensitive=true,
+  comment=[l]{//},
+  string=[b]",
+  alsoletter={\#},
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{keyword}\bfseries,
+  commentstyle=\color{comment}\itshape,
+  stringstyle=\color{string},
+  backgroundcolor=\color{codebg},
+  frame=single,
+  framerule=0pt,
+  xleftmargin=1em,
+  framexleftmargin=1em,
+  showstringspaces=false,
+  columns=fullflexible,
+  keepspaces=true,
+  moredelim=[s][\color{macro}]{\#[}{]},
+}
+
+\title{\texttt{dyn\_shim}}
+\subtitle{Trait objects for traits that refuse}
+\author{Nathan Lilienthal}
+\date{\small\texttt{crates.io/crates/dyn\_shim}}
+
+\begin{document}
+
+\begin{frame}
+  \titlepage
+\end{frame}
+
+% ---------------------------------------------------------------- 1. problem
+
+\begin{frame}[fragile]{The goal: a mixed bag of implementors}
+\begin{lstlisting}
+trait Channel {
+    fn label(&self) -> String;
+    fn deliver(&mut self, message: &str);
+    fn connect() -> Self;
+}
+
+let channels: Vec<Box<dyn Channel>> = vec![
+    Box::new(Email::connect()),
+    Box::new(Webhook::connect()),
+];
+\end{lstlisting}
+\pause
+\begin{lstlisting}[language={},basicstyle=\ttfamily\footnotesize\color{string}]
+error[E0038]: the trait `Channel` is not dyn compatible
+  = note: because associated function `connect` has no `self` parameter
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}{Why: a trait object is a vtable}
+  \begin{itemize}
+    \item \texttt{Box<dyn Trait>} is a data pointer plus a table of function
+          pointers, one per method.
+    \item Every method has to fit in one vtable entry. These cannot:
+    \begin{itemize}
+      \item no receiver (\texttt{fn connect() -> Self})
+      \item \texttt{Self} by value in arguments or returns
+      \item generic methods (\texttt{fn explain<W: Write>})
+      \item \texttt{impl Trait} in the signature
+      \item supertraits like \texttt{Clone} (whose \texttt{clone} returns \texttt{Self})
+    \end{itemize}
+    \item And one bad method poisons the \emph{whole trait}, not just itself.
+  \end{itemize}
+\end{frame}
+
+% ------------------------------------------------- 2. the standard escape hatch
+
+\begin{frame}[fragile]{The standard escape hatch: \texttt{where Self: Sized}}
+\begin{lstlisting}
+trait Channel {
+    fn label(&self) -> String;
+    fn deliver(&mut self, message: &str);
+    fn connect() -> Self where Self: Sized;
+}
+
+let channels: Vec<Box<dyn Channel>> = /* works! */;
+\end{lstlisting}
+  \begin{itemize}
+    \item The gated method is hidden from \texttt{dyn Channel}, so the trait is
+          dyn-compatible again.
+    \item Still callable on every concrete type.
+    \item Honestly: this covers a lot of the basic cases.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Where \texttt{Self: Sized} runs out}
+  \begin{enumerate}
+    \item<1-> \textbf{It is invasive.} dyn-compatibility bookkeeping lives on
+          your source trait's API forever.
+    \item<2-> \textbf{The method could work on an erased value, with a tweak.}
+          \texttt{fn close(self)} could ride as \texttt{Box<Self>};
+          \texttt{fn explain<W: Write>} could take \texttt{\&mut dyn Write}.
+          Gating just throws them away.
+    \item<3-> \textbf{The problem is a supertrait.}
+          \texttt{trait Event: Clone} has no method to gate.
+    \item<4-> \textbf{It is not your trait.} You cannot edit a dependency's
+          trait to add the gate.
+  \end{enumerate}
+\end{frame}
+
+% ----------------------------------------------------------------- 3. the core
+
+\begin{frame}[fragile]{The core idea: generate a second trait}
+  You write:
+\begin{lstlisting}
+#[dyn_shim(DynChannel)]
+trait Channel {
+    fn label(&self) -> String;
+    // ...
+}
+\end{lstlisting}
+\pause
+  The macro generates:
+\begin{lstlisting}
+trait DynChannel {
+    fn label(&self) -> String;
+}
+
+impl<T: Channel> DynChannel for T {
+    fn label(&self) -> String { Channel::label(self) }
+}
+\end{lstlisting}
+  \texttt{Channel} stays exactly as written, and the blanket impl means every
+  \texttt{Channel} is already a \texttt{DynChannel}.
+\end{frame}
+
+\begin{frame}[fragile]{No receiver: skipped}
+\begin{lstlisting}
+#[dyn_shim(DynChannel)]
+trait Channel {
+    // ...
+    fn connect() -> Self;   // receiverless
+}
+\end{lstlisting}
+\pause
+\begin{lstlisting}
+trait DynChannel {
+    // ...
+    // no connect: it cannot ride a vtable
+}
+\end{lstlisting}
+  \begin{itemize}
+    \item What \texttt{Self: Sized} did by gating, the shim does by omission,
+          and the source trait needs no edit.
+    \item \texttt{connect} is still right there on every concrete type.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{By-value \texttt{self}: rewritten}
+\begin{lstlisting}
+#[dyn_shim(DynChannel)]
+trait Channel {
+    // ...
+    fn close(self) -> u32;  // by-value self
+}
+\end{lstlisting}
+\pause
+\begin{lstlisting}
+trait DynChannel {
+    // ...
+    fn close(self: Box<Self>) -> u32;   // self -> Box<Self>
+}
+
+impl<T: Channel> DynChannel for T {
+    // ...
+    fn close(self: Box<Self>) -> u32 { Channel::close(*self) }
+}
+\end{lstlisting}
+  Not skipped: \emph{rewritten} into a form a vtable can carry.
+\end{frame}
+
+\begin{frame}[fragile]{A single generic argument: erased}
+\begin{lstlisting}
+#[dyn_shim(DynChannel)]
+trait Channel {
+    // ...
+    #[dyn_shim(erase)]
+    fn dump<W: Write>(&self, out: &mut W);  // generic argument
+}
+\end{lstlisting}
+\pause
+\begin{lstlisting}
+trait DynChannel {
+    fn dump(&self, out: &mut dyn Write);    // W erased
+}
+impl<T: Channel> DynChannel for T {
+    fn dump(&self, mut out: &mut dyn Write) {
+        Channel::dump(self, &mut out)       // W = &mut dyn Write
+    }
+}
+\end{lstlisting}
+  \begin{itemize}
+    \item Generic behind \texttt{\&}/\texttt{\&mut}, single bound: forwards
+          for real.
+    \item Opt-in: \texttt{W} now dispatches through \texttt{dyn Write} inside
+          the impl.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{A method returning \texttt{Self}: boxed}
+\begin{lstlisting}
+#[dyn_shim(DynChannel)]
+trait Channel {
+    // ...
+    #[dyn_shim(boxed)]
+    fn muted(&self) -> Self;  // Self return
+}
+\end{lstlisting}
+\pause
+\begin{lstlisting}
+trait DynChannel {
+    fn muted(&self) -> Box<dyn DynChannel>;  // Self boxed
+}
+impl<T: Channel> DynChannel for T {
+    fn muted(&self) -> Box<dyn DynChannel> {
+        Box::new(Channel::muted(self))
+    }
+}
+\end{lstlisting}
+  \begin{itemize}
+    \item Opt-in: the one rewrite that adds a cost, one allocation per call.
+    \item Bare \texttt{-> Self} only; \texttt{Option<Self>} and friends stay
+          skipped for now.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{Using it}
+\begin{lstlisting}
+let channels: Vec<Box<dyn DynChannel>> = vec![
+    Box::new(Email::connect()),    // concrete side: connect works
+    Box::new(Webhook::connect()),
+];
+
+for ch in &channels {
+    println!("{}", ch.label());    // forwarded
+}
+
+for ch in channels {
+    let sent = ch.close();         // by-value, through Box<Self>
+}
+\end{lstlisting}
+  \begin{itemize}
+    \item Even the by-value \texttt{close(self)} works on the erased object,
+          which \texttt{Self: Sized} could never give you.
+  \end{itemize}
+\end{frame}
+
+% -------------------------------------------------------------- 4. reflexive
+
+\begin{frame}[fragile]{The shim's debt: \texttt{reflexive}}
+  Gating kept identity free: \texttt{dyn Channel} is a \texttt{Channel}.
+  A shim is a \emph{distinct} trait; source-generic code rejects its objects:
+\begin{lstlisting}
+// ?Sized: lets R be dyn DynRule
+fn passes<R: Rule + ?Sized>(rule: &R, v: i32) -> bool { ... }
+\end{lstlisting}
+\pause
+  \texttt{reflexive} buys it back, implementing \texttt{Rule} for the shim's
+  objects:
+\begin{lstlisting}
+// bare: impl Rule for dyn DynRule; boxed: for Box<dyn DynRule>
+#[dyn_shim(DynRule, reflexive = bare + boxed)]
+trait Rule {
+    fn check(&self, value: i32) -> bool;
+    #[dyn_shim(stub = None)]        // degrade gracefully
+    fn parsed<T: FromStr>(&self, text: &str) -> Option<T>;
+}
+\end{lstlisting}
+\pause
+  An erased value flows back in:
+\begin{lstlisting}
+let rule: Box<dyn DynRule> = ...;
+passes(&*rule, 12);
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}{Reflexive: accounting for every method}
+  The reflexive impl must account for \emph{every} source method:
+  \begin{itemize}
+    \item Whatever the shim carries forwards through it, including the
+          \texttt{erase} and \texttt{boxed} rewrites from before: nothing new.
+    \item \texttt{\#[dyn\_shim(stub = expr)]}: cannot forward, so return a
+          fallback value instead.
+    \item \texttt{\#[dyn\_shim(panic)]}: the last resort, when no fallback
+          makes sense. Just sugar for \texttt{stub = panic!("...")} with a
+          message naming the method and shim.
+  \end{itemize}
+  \begin{alertblock}{The honest tradeoff}
+    \texttt{where Self: Sized} rejects a bad call at \emph{compile time};
+    \texttt{\#[dyn\_shim(panic)]} compiles and aborts at \emph{runtime}.
+    If hiding the method is the only remediation a trait needs, gating
+    fails earlier. Reach for \texttt{panic} only when the reflexive impl
+    is worth that risk.
+  \end{alertblock}
+\end{frame}
+
+% ------------------------------------------------------------ 5. clone / hash
+
+\begin{frame}[fragile]{A \texttt{Clone} supertrait: nothing to gate}
+\begin{lstlisting}
+trait Shape: Clone {  // not dyn compatible: clone returns Self
+    fn area(&self) -> u32;
+}
+\end{lstlisting}
+  \begin{itemize}
+    \item Nothing to gate: the offender is a \emph{bound}, not a method.
+    \item The classic fix is a whole crate per trait:
+          \texttt{dyn-clone} with \texttt{clone\_trait\_object!},
+          \texttt{dyn-hash} with \texttt{hash\_trait\_object!}.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{Recognized bounds}
+\begin{lstlisting}
+#[dyn_shim(DynShape: Clone + Hash)]
+trait Shape {
+    fn area(&self) -> u32;
+    fn scale(&mut self, factor: u32);
+}
+
+let shapes: Vec<Box<dyn DynShape>> = /* ... */;
+let copy = shapes.clone();        // Box<dyn DynShape>: Clone
+let hash = RandomState::new().hash_one(&*shapes[0]); // dyn DynShape: Hash
+\end{lstlisting}
+  \begin{itemize}
+    \item \texttt{Clone} and \texttt{Hash} in the shim's bounds are
+          \emph{recognized}: instead of becoming supertraits, they generate
+          cloning and hashing machinery on the trait objects.
+    \item The same move as \texttt{reflexive}, aimed at a \emph{bound}:
+          implement the unreachable trait on the shim's trait objects.
+    \item No crate features, no \texttt{unsafe}, written or generated.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{The \texttt{dyn-clone} / \texttt{dyn-hash} replacement}
+  Already have a dyn-compatible trait? Bind the shipped
+  \texttt{DynClone} / \texttt{DynHash} onto it:
+\begin{lstlisting}
+use dyn_shim::{dyn_shim_bind, DynClone, DynHash};
+
+#[dyn_shim_bind(DynClone + DynHash)]
+trait Product: DynClone + DynHash {
+    fn price(&self) -> u32;
+}
+\end{lstlisting}
+  \begin{itemize}
+    \item Near drop-in for \texttt{dyn-clone} + \texttt{dyn-hash}: keep the
+          supertraits, replace the \texttt{*\_trait\_object!} calls with one
+          attribute.
+    \item The point: those crates are each a hand-built special case.
+          Here they fall out of the general mechanism, and any
+          \texttt{\#[dyn\_shim]} shim binds the same way.
+    \item The crate's one \texttt{unsafe} block lives here: cloning through
+          an already-erased object needs a pointer-metadata splice, taken
+          from \texttt{dyn-clone} itself.
+  \end{itemize}
+\end{frame}
+
+% -------------------------------------------------------------- 6. foreign
+
+\begin{frame}[fragile]{Not your trait? \texttt{\#[dyn\_shim\_foreign]}}
+\begin{lstlisting}
+use dyn_shim::dyn_shim_foreign;
+
+// vendor::Widget has build() -> Self and consume(self).
+#[dyn_shim_foreign(vendor::Widget)]
+trait DynWidget: Clone {  // recognized, like DynShape's Clone
+    fn render(&self) -> String;
+    fn resize(&mut self, by: i32);
+    fn consume(self) -> String;   // same Box<Self> rewrite
+}
+\end{lstlisting}
+  \begin{itemize}
+    \item A proc macro cannot see another crate's source, so here the
+          annotated trait \emph{is} the shim: restate what should forward.
+    \item A restated signature that does not match fails to compile.
+  \end{itemize}
+\end{frame}
+
+% -------------------------------------------------------------------- 7. close
+
+\begin{frame}{Recap: one mechanism, three paths}
+  \begin{itemize}
+    \item \texttt{where Self: Sized}: when hiding the offending methods is
+          enough, stop there.
+    \item \texttt{\#[dyn\_shim]}: a generated shim trait; skip or rewrite
+          what a vtable cannot carry, keep the source trait clean.
+  \end{itemize}
+  \vspace{0.5em}
+  Three paths from there, in any combination:
+  \begin{itemize}
+    \item \texttt{reflexive}: shim objects satisfy the source trait again
+    \item recognized \texttt{Clone} / \texttt{Hash} bounds and
+          \texttt{\#[dyn\_shim\_bind]}: the \texttt{dyn-clone} /
+          \texttt{dyn-hash} problem, generalized
+    \item \texttt{\#[dyn\_shim\_foreign]}: traits you do not own
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Thanks}
+  \begin{center}
+    {\Large \texttt{dyn\_shim}}\\[1em]
+    \texttt{crates.io/crates/dyn\_shim}\\
+    \texttt{docs.rs/dyn\_shim}\\
+    \texttt{github.com/nixpulvis/dyn\_shim}\\[1em]
+    One runnable example per feature in \texttt{examples/}:\\
+    \texttt{shim}, \texttt{clone\_and\_hash}, \texttt{bind},
+    \texttt{reflexive}, \texttt{foreign}
+  \end{center}
+\end{frame}
+
+\end{document}
